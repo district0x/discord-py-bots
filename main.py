@@ -4,7 +4,7 @@ from discord.ext import commands
 
 # Get the value of an environment variable
 playbotToken = os.environ.get('PLAYBOT')
-playbotClientID = os.environ.get('PLAYBOY_CLIENT_ID')
+playbotClientID = os.environ.get('PLAYBOT_CLIENT_ID')
 
 intents = discord.Intents.default()
 intents.messages = True
