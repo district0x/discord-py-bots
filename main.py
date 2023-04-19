@@ -7,14 +7,19 @@ import time
 import datetime
 
 primer = f"""
-My only purpose is to categorise user input into 3 categories. 
+My only purpose is to categorise user input into 5 categories. 
 First category is for job offers. If I think given text can be classified as a job offer, my response will be
 one word "job".
 Second category is for freelance worker. If I think given text can be classified as a profile description of a 
-freelance worker looking for a job, my response will be one word: "freelancer". 
-Third category is for unidentified. If I think given text can't be classified as neither of previous 2 categories, 
+freelance worker looking for a job, my response will be one word: "freelancer".
+Third category is for showing list of user posts. If I think given text can be classified as a 
+request to show list of user posts or job offers or freelance workers profile descriptions, my response will be one 
+word: "list". This also applies if given text is user saying he wants to see something or asks what you have.
+Fourth category is for deleting previously submitted post by user. If I think given text can be classified as a 
+request for deletion of user post, my response will be one word: "delete". 
+Fifth category is for unidentified. If I think given text can't be classified as neither of previous 2 categories, 
 my response will be one word: "unidentified".
-I only respond with one of following phrases: "job", "freelancer", "unidentified".
+I only respond with one of following phrases: "job", "freelancer", "list", "delete", "unidentified".
 
 GIVEN TEXT:
 """
@@ -49,17 +54,16 @@ I can also react to some aspects of his/her job offer, that is given to me in us
 """
 
 unidentified_prompt_message = f"""
-I'm sorry, but I only assist with job and work-related requests.\n"
-If you're a freelance worker interested in job opportunities, feel
-free to talk to me similarly as in this example: \n
-"As a freelance worker proficient in HTML, CSS, and JavaScript, 
-I am actively seeking job opportunities related to web development and
-front-end technologies."\n\n"
-If you're offering a job opportunity, you may want to try something
-like this: \n"
-"We are seeking a skilled Python developer with expertise in chatbot 
-development to join our team and contribute to the creation of 
-cutting-edge conversational AI solutions."\n```"
+Hello, I am EthlanceGPT! 👋
+My assistance is limited to job and work-related inquiries.\n
+If you are a freelance worker looking for job opportunities, please feel free to communicate with me using a similar approach as shown in this example:\n
+*As a freelance worker proficient in HTML, CSS, and JavaScript, I am actively seeking job opportunities related to web development and front-end technologies.*\n
+If you have a job opportunity to offer, you could consider using something along these lines:\n
+*We are seeking a skilled Python developer with expertise in chatbot development to join our team and contribute to the creation of cutting-edge conversational AI solutions.*\n
+If you wish to display a list of user posts related to a specific expertise, you may find the following example helpful:\n
+*Show me posts related to Javascript, React.js*\n
+If you would like to delete your current post, you can inform me using a similar approach such as: 
+*I want to delete my post about HTML, CSS*
 """
 
 # Get the value of environment variables
@@ -80,9 +84,9 @@ intents.messages = True
 intents.guilds = True
 intents.message_content = True
 
-min_pinecone_score = 0.8
+min_pinecone_score = 0.77
 
-bot = commands.AutoShardedBot(command_prefix='/', intents=intents)
+bot = discord.Client(intents=intents)
 
 
 @bot.event
@@ -115,14 +119,108 @@ def time_ago(timestamp):
 
 def format_time_ago(timestamp):
     time_ago_map = time_ago(timestamp)
-    if time_ago_map["days"] > 0:
-        return str(time_ago_map["days"]) + " days ago"
+    days_ago = time_ago_map["days"]
+    hours_ago = time_ago_map["hours"]
+    minutes_ago = time_ago_map["minutes"]
 
-    if time_ago_map["hours"] > 0:
-        return str(time_ago_map["hours"]) + " hours ago"
+    if days_ago > 0:
+        return f"{days_ago} days ago"
 
-    if time_ago_map["minutes"] > 0:
-        return str(time_ago_map["minutes"]) + " minutes ago"
+    if hours_ago > 0:
+        return f"{hours_ago} hours ago"
+
+    if minutes_ago > 0:
+        return f"{minutes_ago} minutes ago"
+
+
+def format_user_post(user_post):
+    metadata = user_post["metadata"]
+    author_id = metadata["author_id"]
+    text = metadata["text"]
+    created_ago = format_time_ago(metadata["created"])
+
+    return f"<@{author_id}>: \"{text}\" ({created_ago})"
+
+
+def handle_user_post(index, prompt_type, embeds, prompt, message):
+    index.upsert([(str(message.id), embeds, {"text": prompt,
+                                             "author_id": str(message.author.id),
+                                             "prompt_type": prompt_type,
+                                             "created": time.time()})])
+
+    pine_res = index.query(vector=embeds,
+                           filter={
+                               "prompt_type": "freelancer" if prompt_type == "job" else "job"
+                           },
+                           top_k=5,
+                           include_metadata=True)
+
+    matches = pine_res['matches']
+    filtered_matches = [match for match in matches if match['score'] >= min_pinecone_score]
+
+    print(filtered_matches)
+
+    openai_thank_primer = ""
+    if not filtered_matches:
+        if prompt_type == "job":
+            openai_thank_primer = job_thank_primer_no_items
+        elif prompt_type == "freelancer":
+            openai_thank_primer = freelancer_thank_primer_no_items
+    else:
+        if prompt_type == "job":
+            openai_thank_primer = job_thank_primer
+        elif prompt_type == "freelancer":
+            openai_thank_primer = freelancer_thank_primer
+
+    openai_thank_res = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": openai_thank_primer},
+            {"role": "user", "content": prompt}]
+    )
+
+    openai_thank_reply = openai_thank_res['choices'][0]['message']['content']
+
+    if filtered_matches:
+        results_text = "\n\n".join([format_user_post(item) for item in filtered_matches])
+        openai_thank_reply = f"{openai_thank_reply} \n\n {results_text}"
+
+    return openai_thank_reply
+
+
+def handle_delete_post(index, embeds, message):
+    pine_res = index.query(vector=embeds,
+                           filter={
+                               "author_id": str(message.author.id)
+                           },
+                           top_k=1,
+                           include_metadata=True)
+    matches = pine_res['matches']
+
+    if matches:
+        post_id = matches[0]["id"]
+        index.delete(ids=[post_id])
+
+        return f"I have deleted following post:\n\n {format_user_post(matches[0])}"
+    else:
+        return f"I'm sorry, I haven't found any post of yours you described. Please describe in more detail what" \
+               f"post you'd like me to delete."
+
+
+def handle_show_list(index, embeds):
+    pine_res = index.query(vector=embeds,
+                           top_k=5,
+                           include_metadata=True)
+
+    matches = pine_res['matches']
+    filtered_matches = [match for match in matches if match['score'] >= min_pinecone_score]
+
+    if filtered_matches:
+        formatted_matches = "\n\n".join([format_user_post(item) for item in filtered_matches])
+        return f"According to your description, I have compiled the following list of user posts:\n\n" \
+               f"{formatted_matches}"
+    else:
+        return f"Based on your description, it appears that there are no user submissions found in our chat."
 
 
 @bot.event
@@ -136,10 +234,11 @@ async def on_message(message):
         prompt = message.content.replace(f'<@{bot.user.id}>', '').strip()
 
         print("Prompt: " + prompt)
-        if prompt.lower() == "clear memory":
+        if message.author.id == 322447211872911370 and \
+                prompt.lower() == "absolutely sure about clearing your memory":
             index = pinecone.Index(pinecone_index_name)
             index.delete(deleteAll='true')
-            await message.channel.send("I've cleared my memory")
+            await message.reply("I've cleared my memory")
         else:
             if prompt:
                 openai_messages = []
@@ -157,7 +256,11 @@ async def on_message(message):
                 print(openai_reply)
 
                 if "unidentified" not in openai_reply:
-                    if "job" in openai_reply:
+                    if "list" in openai_reply:
+                        prompt_type = "list"
+                    elif "delete" in openai_reply:
+                        prompt_type = "delete"
+                    elif "job" in openai_reply:
                         prompt_type = "job"
                     elif "freelancer" in openai_reply:
                         prompt_type = "freelancer"
@@ -181,72 +284,23 @@ async def on_message(message):
                     index = pinecone.Index(pinecone_index_name)
                     print(index.describe_index_stats())
 
-                    index.upsert([(str(message.id), embeds, {"text": prompt,
-                                                             "author_id": str(message.author.id),
-                                                             "prompt_type": prompt_type,
-                                                             "created": time.time()})])
-
-                    pine_res = index.query(vector=embeds,
-                                           filter={
-                                               "prompt_type": "freelancer" if prompt_type == "job" else "job"
-                                           },
-                                           top_k=5,
-                                           include_metadata=True)
-
-                    matches = pine_res['matches']
-                    filtered_matches = [match for match in matches if match['score'] >= min_pinecone_score]
-
-                    print(filtered_matches)
-
-                    openai_thank_primer = ""
-                    if not filtered_matches:
-                        if prompt_type == "job":
-                            openai_thank_primer = job_thank_primer_no_items
-                        elif prompt_type == "freelancer":
-                            openai_thank_primer = freelancer_thank_primer_no_items
+                    if prompt_type == "delete":
+                        result_message = handle_delete_post(index=index,
+                                                            embeds=embeds,
+                                                            message=message)
+                    elif prompt_type == "list":
+                        result_message = handle_show_list(index=index,
+                                                          embeds=embeds)
                     else:
-                        if prompt_type == "job":
-                            openai_thank_primer = job_thank_primer
-                        elif prompt_type == "freelancer":
-                            openai_thank_primer = freelancer_thank_primer
+                        result_message = handle_user_post(index=index,
+                                                          prompt_type=prompt_type,
+                                                          embeds=embeds,
+                                                          message=message,
+                                                          prompt=prompt)
 
-                    openai_thank_res = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": openai_thank_primer},
-                            {"role": "user", "content": prompt}]
-                    )
-
-                    openai_thank_reply = openai_thank_res['choices'][0]['message']['content']
-
-                    if filtered_matches:
-                        results_text = "\n\n".join(["<@" + item["metadata"]["author_id"] + ">: \"" +
-                                                    item["metadata"]["text"] +
-                                                    "\" (" + format_time_ago(item["metadata"]["created"]) + ")"
-                                                    for item in filtered_matches])
-                        print(results_text)
-                        openai_thank_reply = openai_thank_reply + "\n\n" + results_text
-
-                    await message.channel.send(openai_thank_reply)
+                    await message.reply(result_message)
                 else:
-                    await message.channel.send(unidentified_prompt_message)
-
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        # If command is not found, suggest similar commands
-        cmd = ctx.message.content.split()[0]
-        suggested_cmds = [cmd.name for cmd in bot.commands if cmd.name.startswith(cmd)]
-        if suggested_cmds:
-            suggested_cmds.sort()
-            await ctx.send(f"Command not found. Did you mean: `{', '.join(suggested_cmds)}`?")
-        else:
-            await ctx.send("Command not found. Please use a valid command.")
-    else:
-        raise error
+                    await message.reply(unidentified_prompt_message)
 
 
 # invite_url = discord.utils.oauth_url(playbot_client_id, permissions=discord.Permissions(permissions=534723950656))
