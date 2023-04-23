@@ -5,6 +5,7 @@ import openai
 import pinecone
 import time
 import datetime
+import logging
 
 primer = f"""
 My only purpose is to categorise user input into 5 categories. 
@@ -66,18 +67,23 @@ If you would like to delete your current post, you can inform me using a similar
 *I want to delete my post about HTML, CSS*
 """
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ethlanceGPT")
+
+
 # Get the value of environment variables
-playbot_token = os.environ.get('PLAYBOT')
-playbot_client_id = os.environ.get('PLAYBOT_CLIENT_ID')
+ethlanceGPT_token = os.environ.get('ETHLANCE_GPT_TOKEN')
+ethlanceGPT_client_id = os.environ.get('ETHLANCE_GPT_CLIENT_ID')
 openai.api_key = os.environ.get('OPENAI_API_KEY')
 pinecone_api_key = os.environ.get('PINECONE_API_KEY')  # Add this line to retrieve Pinecone API key
 
-pinecone.init(api_key=pinecone_api_key, environment="us-east-1-aws")
+pinecone.init(api_key=pinecone_api_key, environment="northamerica-northeast1-gcp")
 openai_embed_model = "text-embedding-ada-002"
-pinecone_index_name = "playbot-index"
+pinecone_index_name = "ethlance-gpt"
 
 pinecone_indexes = pinecone.list_indexes()
-print(pinecone_indexes)
+logger.info(f"Pinecone indexes: {pinecone_indexes}")
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -91,8 +97,7 @@ bot = discord.Client(intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user.name}')
-    print('------')
+    logger.info(f"Logged in as {bot.user.name}")
 
 
 # Define a custom help command
@@ -131,6 +136,8 @@ def format_time_ago(timestamp):
 
     if minutes_ago > 0:
         return f"{minutes_ago} minutes ago"
+    else:
+        return "few moments ago"
 
 
 def format_user_post(user_post):
@@ -139,7 +146,7 @@ def format_user_post(user_post):
     text = metadata["text"]
     created_ago = format_time_ago(metadata["created"])
 
-    return f"<@{author_id}>: \"{text}\" ({created_ago})"
+    return f"<@{author_id}>: *{text}* ({created_ago})"
 
 
 def handle_user_post(index, prompt_type, embeds, prompt, message):
@@ -158,7 +165,7 @@ def handle_user_post(index, prompt_type, embeds, prompt, message):
     matches = pine_res['matches']
     filtered_matches = [match for match in matches if match['score'] >= min_pinecone_score]
 
-    print(filtered_matches)
+    logger.info(f"User post filtered matches: {filtered_matches}")
 
     openai_thank_primer = ""
     if not filtered_matches:
@@ -229,11 +236,10 @@ async def on_message(message):
         return
 
     if bot.user.mentioned_in(message):
-        print(message)
         # Check if bot is mentioned in the message
         prompt = message.content.replace(f'<@{bot.user.id}>', '').strip()
 
-        print("Prompt: " + prompt)
+        logger.info(f"Prompt: {prompt}")
         if message.author.id == 322447211872911370 and \
                 prompt.lower() == "absolutely sure about clearing your memory":
             index = pinecone.Index(pinecone_index_name)
@@ -253,7 +259,7 @@ async def on_message(message):
                 openai_reply = openai_res['choices'][0]['message']['content']
                 prompt_type = "unidentified"
 
-                print(openai_reply)
+                logger.info(f"OpenAI reply: {openai_reply}")
 
                 if "unidentified" not in openai_reply:
                     if "list" in openai_reply:
@@ -265,7 +271,7 @@ async def on_message(message):
                     elif "freelancer" in openai_reply:
                         prompt_type = "freelancer"
 
-                print("Prompt Type: " + prompt_type)
+                logger.info(f"Prompt Type: {prompt_type}")
 
                 if prompt_type != "unidentified":
                     embeds_res = openai.Embedding.create(
@@ -276,13 +282,13 @@ async def on_message(message):
                     # we can extract embeddings to a list
                     embeds = [record['embedding'] for record in embeds_res['data']]
 
-                    print("Embeds length: " + str(len(embeds[0])))
+                    logger.info(f"Embeds length: {len(embeds[0])}")
 
                     if pinecone_index_name not in pinecone_indexes:
                         raise NameError("Pinecone index name does not exist")
 
                     index = pinecone.Index(pinecone_index_name)
-                    print(index.describe_index_stats())
+                    logger.info(f"Index stats: {index.describe_index_stats()}")
 
                     if prompt_type == "delete":
                         result_message = handle_delete_post(index=index,
@@ -303,8 +309,8 @@ async def on_message(message):
                     await message.reply(unidentified_prompt_message)
 
 
-# invite_url = discord.utils.oauth_url(playbot_client_id, permissions=discord.Permissions(permissions=534723950656))
+# invite_url = discord.utils.oauth_url(ethlanceGPT_client_id, permissions=discord.Permissions(permissions=534723950656))
 
-# print(f'Invite URL: {invite_url}')
+# logger.info(f"Invite URL: {invite_url}")
 
-bot.run(playbot_token)
+bot.run(ethlanceGPT_token)
