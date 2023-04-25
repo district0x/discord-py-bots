@@ -99,6 +99,7 @@ intents.guilds = True
 intents.message_content = True
 
 min_pinecone_score = 0.77
+max_prompt_length = 1000
 
 # Create an instance of APICounter with a maximum limit of 5 requests per day
 api_counter = APICounter(max_uses_per_day)
@@ -254,6 +255,12 @@ async def on_message(message):
             return
 
         prompt = message.content.replace(f'<@{bot.user.id}>', '').strip()
+
+        if len(prompt) > max_prompt_length:
+            logger.info(f"Maximum prompt length exceeded: {len(prompt)} characters by {message.author.id}")
+            await message.reply(f"Apologies, but you have exceeded maximum input length of {max_prompt_length} characters. "
+                                f"Kindly aim for greater conciseness, if possible.")
+            return
 
         logger.info(f"Prompt: {prompt}")
         if message.author.id == admin_user_id and \
