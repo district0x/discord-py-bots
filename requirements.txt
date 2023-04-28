@@ -19,3 +19,8 @@ virtualfish==2.5.5
 yarl==1.8.2
 openai~=0.27.4
 pinecone-client~=2.2.1
+discord-py-interactions~=5.1.0
+web3~=6.2.0
+ens-normalize~=2.0.0
+pycryptodome~=3.17
+python-dotenv~=1.0.0

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Ethereum Transaction</title>
+    <!-- Include MetaMask provider library -->
+    <script src="https://unpkg.com/@metamask/detect-provider/dist/detect-provider.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/web3/1.9.0/web3.min.js"
+            integrity="sha512-mUvdtCaVKd9dby/UnYGKMLkP3eT7EA6QNFN5iSEjvMf8TFPq2oZFIemWL46iypQcL8xYNdx7wQIA1oYnTXuYhg=="
+            crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+</head>
+<body>
+<script type="text/javascript">
+
+  let accounts = [];
+  let provider = false;
+
+  async function checkMetaMask() {
+    provider = await detectEthereumProvider();
+
+    if (provider) {
+      console.log("MetaMask installed");
+    } else {
+      var body = document.body;
+      body.textContent = "Please install MetaMask browser extension";
+    }
+  }
+
+  async function sendTransaction() {
+
+    const transactionParameters = {
+        to: getURLParameter("to"),
+        from: accounts[0],
+        value: getURLParameter("value"),
+        data: getURLParameter("data")
+    };
+
+    console.log(transactionParameters);
+    let body = document.body;
+
+    try {
+        const txHash = await ethereum.request({
+          method: 'eth_sendTransaction',
+          params: [transactionParameters],
+        });
+
+        console.log(txHash);
+        body.textContent = "You can close this tab now, your transaction has been sent: " + txHash;
+    } catch (error) {
+        console.error(error);
+        body.textContent = "Transaction has not been sent";
+    }
+  }
+
+  async function getAccount() {
+    try {
+        accounts = await ethereum.request({ method: 'eth_requestAccounts' });
+        console.log(accounts);
+    } catch (error) {
+        console.error(error);
+        let body = document.body;
+        body.textContent = "Account has not been selected";
+    }
+  }
+
+  function getURLParameter(name) {
+    const searchParams = new URLSearchParams(window.location.search);
+    return searchParams.get(name);
+  }
+
+  function isMobileDevice() {
+    const mobileDeviceRegex = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i;
+    return mobileDeviceRegex.test(navigator.userAgent);
+  }
+
+  function openMetamaskDapp() {
+    let url = window.location.href;
+    let newLocation = url.slice(url.indexOf("//") + 2);
+    window.location.href = "https://metamask.app.link/dapp/" + newLocation;
+  }
+
+  async function run() {
+    await checkMetaMask();
+    if (!provider & isMobileDevice()) {
+        openMetamaskDapp();
+    } else if (provider) {
+        await getAccount();
+        await sendTransaction();
+    }
+  }
+
+  run();
+</script>
+
+</body>
+</html>
