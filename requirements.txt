@@ -24,3 +24,4 @@ web3~=6.2.0
 ens-normalize~=2.0.0
 pycryptodome~=3.17
 python-dotenv~=1.0.0
+pyshorteners~=1.0.1
