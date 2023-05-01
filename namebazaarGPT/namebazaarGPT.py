@@ -128,10 +128,11 @@ async def start_commit_checking_interval(
 
         if commitment_timestamp > 0:
             # Wait until commit period ends
-            await asyncio.sleep(60)
+            await asyncio.sleep(65)
 
             # Add 10% to account for price fluctuation; the difference is refunded.
             rent_price_wei = eth_registrar.functions.rentPrice(name_label, register_duration).call()[0]
+            rent_price_wei = int(float(rent_price_wei) * 1.1)
             rent_price_eth = web3.from_wei(rent_price_wei, "ether")
 
             logger.info(f"rent price: {rent_price_eth}")

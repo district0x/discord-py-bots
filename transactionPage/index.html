@@ -29,10 +29,16 @@
 
   async function sendTransaction() {
 
+    if (typeof BigInt === "undefined") {
+      var body = document.body;
+      body.textContent = "BigInt is not supported in this browser";
+      console.log("BigInt is not supported in this browser");
+    }
+
     const transactionParameters = {
         to: getURLParameter("to"),
         from: accounts[0],
-        value: getURLParameter("value"),
+        value: "0x" + BigInt(getURLParameter("value")).toString(16),
         data: getURLParameter("data")
     };
 
@@ -46,7 +52,7 @@
         });
 
         console.log(txHash);
-        body.textContent = "You can close this tab now, your transaction has been sent: " + txHash;
+        body.textContent = "You can close this tab now, your transaction has been sent. Transaction ID: " + txHash;
     } catch (error) {
         console.error(error);
         body.textContent = "Transaction has not been sent";
