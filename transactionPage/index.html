@@ -30,7 +30,7 @@
   async function sendTransaction() {
 
     if (typeof BigInt === "undefined") {
-      var body = document.body;
+      let body = document.body;
       body.textContent = "BigInt is not supported in this browser";
       console.log("BigInt is not supported in this browser");
     }
@@ -43,7 +43,6 @@
     };
 
     console.log(transactionParameters);
-    let body = document.body;
 
     try {
         const txHash = await ethereum.request({
@@ -52,6 +51,7 @@
         });
 
         console.log(txHash);
+        let body = document.body;
         body.textContent = "You can close this tab now, your transaction has been sent. Transaction ID: " + txHash;
     } catch (error) {
         console.error(error);

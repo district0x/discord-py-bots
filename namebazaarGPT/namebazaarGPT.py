@@ -10,10 +10,9 @@ import time
 import datetime
 import logging
 import json
-from web3 import Web3
+from web3 import Web3, WebsocketProvider
 from ens_normalize import ens_cure, DisallowedNameError
 import binascii
-from namehash import namehash
 import re
 import time
 import threading
@@ -34,7 +33,7 @@ infura_url = os.getenv('INFURA_URL')
 web3_network = os.getenv('WEB3_NETWORK')
 tx_page_host = os.getenv('TX_PAGE_HOST')
 bitly_api_key = os.getenv('BITLY_API_KEY')
-commit_checking_interval = int(os.getenv('COMMIT_CHECKING_INTERVAL'))
+tx_checking_interval = int(os.getenv('TX_CHECKING_INTERVAL'))
 
 contract_addresses = { # Make sure addresses are checksum format
     "mainnet": {
@@ -101,12 +100,35 @@ def get_tx_page_url(tx_data):
     return f"{tx_page_host}?to={tx_data['to']}&data={tx_data['data']}&value={tx_data['value']}"
 
 
-web3 = Web3(Web3.HTTPProvider(infura_url))
+web3 = Web3(Web3.WebsocketProvider(infura_url))
 eth_registrar = web3.eth.contract(address=get_contract_address("ETHRegistrarController"),
                                   abi=get_abi("ETHRegistrarController"))
 
 
-async def start_commit_checking_interval(
+def less_hours_passed(start_time, hours):
+    now = datetime.datetime.now()
+    time_passed = now - start_time
+    return time_passed < datetime.timedelta(hours=hours)
+
+
+async def listen_for_register(interval_start, name_label, owner, ctx):
+    label_hash = Web3.keccak(name_label.encode("utf-8"))
+    event_filter = eth_registrar.events.NameRegistered.create_filter(
+        fromBlock="latest",
+        argument_filters={"label": label_hash, "owner": owner}
+    )
+    while less_hours_passed(interval_start, 72):
+        events = event_filter.get_new_entries()
+        logger.info(f"register events: {events}")
+        if events:
+            await ctx.send(f"Congratulations, you are now owner of `{add_eth_suffix(name_label)}`!")
+            break
+
+        await asyncio.sleep(tx_checking_interval)
+
+
+
+async def listen_for_commit(
         interval_start,
         commitment,
         name_label,
@@ -114,15 +136,7 @@ async def start_commit_checking_interval(
         register_duration,
         salt_bytes,
         ctx):
-    while True:
-
-        # Check if 24 hours have passed since interval_start
-        now = datetime.datetime.now()
-        time_passed = now - interval_start
-        if time_passed >= datetime.timedelta(hours=24):
-            logger.info("Stopping interval after 24 hours")
-            break
-
+    while less_hours_passed(interval_start, 24):
         commitment_timestamp = eth_registrar.functions.commitments(commitment).call()
         logger.info(f"Commitment Timestamp...{commitment_timestamp}")
 
@@ -165,9 +179,15 @@ async def start_commit_checking_interval(
 
             await ctx.send(f"Great! Now you're ready to finish your registration of {add_eth_suffix(name_label)}. "
                            f"The cost is {rent_price_eth} ETH.", embeds=embed)
+
+            await listen_for_register(
+                interval_start=datetime.datetime.now(),
+                name_label=name_label,
+                owner=eth_address,
+                ctx=ctx)
             break
 
-        await asyncio.sleep(commit_checking_interval)
+        await asyncio.sleep(tx_checking_interval)
 
 
 
@@ -218,9 +238,6 @@ async def register(ctx: SlashContext, ens_name, eth_address):
             await ctx.send(f"I apologize, but the name `{cured_name}` is not available for registration.")
             return
 
-        hashed_name = namehash(cured_name)
-        hashed_label = remove_eth_suffix(cured_name)
-
         salt = os.urandom(32).hex()
         salt_bytes = bytes.fromhex(salt)
 
@@ -254,7 +271,7 @@ async def register(ctx: SlashContext, ens_name, eth_address):
         )
 
         await ctx.send(f"You're about to register `{cured_name}`!", embeds=embed)
-        await start_commit_checking_interval(
+        await listen_for_commit(
             commitment=commitment,
             interval_start=datetime.datetime.now(),
             ctx=ctx,
