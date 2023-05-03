@@ -1,22 +1,18 @@
-from dotenv import load_dotenv
+import asyncio
+import binascii
+import datetime
+import json
+import logging
 import os
-import sys
-from interactions import Client, Intents, slash_command, slash_option, SlashContext, OptionType, ActionRow, Button, ButtonStyle, Task, IntervalTrigger
-from interactions.models.discord import Embed
-import discord
+import re
+
 import openai
 import pinecone
-import time
-import datetime
-import logging
-import json
-from web3 import Web3, WebsocketProvider
+from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
-import binascii
-import re
-import time
-import threading
-import asyncio
+from interactions import Client, Intents, slash_command, slash_option, SlashContext, OptionType
+from interactions.models.discord import Embed, BrandColors
+from web3 import Web3
 
 load_dotenv()
 
@@ -88,14 +84,6 @@ def remove_eth_suffix(s: str) -> str:
         return s
 
 
-def is_valid_ethereum_address(address):
-    # Check that the address starts with '0x'
-    if not re.match(r"^0x[a-fA-F0-9]{40}$", address):
-        return False
-
-    return True
-
-
 def get_tx_page_url(tx_data):
     return f"{tx_page_host}?to={tx_data['to']}&data={tx_data['data']}&value={tx_data['value']}"
 
@@ -121,7 +109,8 @@ async def listen_for_register(interval_start, name_label, owner, ctx):
         events = event_filter.get_new_entries()
         logger.info(f"register events: {events}")
         if events:
-            await ctx.send(f"Congratulations, you are now owner of `{add_eth_suffix(name_label)}`!")
+            ens_name = add_eth_suffix(name_label)
+            await ctx.send(f"Congratulations, {ctx.author.mention}! You are now the proud owner of `{ens_name}`.")
             break
 
         await asyncio.sleep(tx_checking_interval)
@@ -171,14 +160,21 @@ async def listen_for_commit(
 
             tx_url = get_tx_page_url(tx_data)
 
+            ens_name = add_eth_suffix(name_label)
+
             embed = Embed(
-                title="Finish Registration",
-                description=f"Click this link to finish registration process for {add_eth_suffix(name_label)}",
+                title=f"Finish Registration for `{ens_name}`",
+                description=f"To complete the registration process for `{ens_name}`, please click on the link provided above.\n"
+                            f"The ENS cost for 1 year registration is {round(rent_price_eth, 3)} ETH.\n"
+                            f"Upon selecting this option, the link will automatically launch in your web browser and "
+                            f"trigger the MetaMask extension or the app on the mobile.",
+                color=BrandColors.GREEN,
                 url=tx_url
             )
 
-            await ctx.send(f"Great! Now you're ready to finish your registration of {add_eth_suffix(name_label)}. "
-                           f"The cost is {rent_price_eth} ETH.", embeds=embed)
+            await ctx.send(f"{ctx.author.mention} Great! Now you are just a step away from registering `{ens_name}`. ",
+                           embeds=embed,
+                           ephemeral=True)
 
             await listen_for_register(
                 interval_start=datetime.datetime.now(),
@@ -226,8 +222,15 @@ async def register(ctx: SlashContext, ens_name, eth_address):
         cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
 
-        if not is_valid_ethereum_address(eth_address):
-            await ctx.send(f"It appears that the Ethereum address you provided is not valid.")
+        if not Web3.is_checksum_address(eth_address):
+            await ctx.send(f"It appears that the Ethereum address you provided is not valid. "
+                           f"Please provide the address in checksum format", ephemeral=True)
+            return
+
+        if "." in name_label:
+            await ctx.send(f"We apologize for the inconvenience, but at the moment, we do not offer support for "
+                           f"registering subnames. However, we plan to add this feature soon. "
+                           f"Please feel free to share your intended use case with us!", ephemeral=True)
             return
 
         is_available = eth_registrar.functions.available(name_label).call()
@@ -235,7 +238,7 @@ async def register(ctx: SlashContext, ens_name, eth_address):
         logger.info(f"available: {is_available}")
 
         if not is_available:
-            await ctx.send(f"I apologize, but the name `{cured_name}` is not available for registration.")
+            await ctx.send(f"I apologize, but the name `{cured_name}` is not available for registration.", ephemeral=True)
             return
 
         salt = os.urandom(32).hex()
@@ -265,12 +268,17 @@ async def register(ctx: SlashContext, ens_name, eth_address):
         tx_url = get_tx_page_url(tx_data)
 
         embed = Embed(
-            title="Start Registration",
-            description=f"Click this link to start registration process for {cured_name}",
+            title=f"Begin Registration for `{cured_name}`",
+            description=f"To initiate the registration process for `{cured_name}`, please click on the link above.\n"
+                        f"Upon clicking this, the URL will open in your browser, which will then automatically launch"
+                        f" your MetaMask browser extension or the app on the mobile. Please make sure you have "
+                        f"the MetaMask installed.\n"
+                        f"You will be notified once we are ready to proceed with the second step of the registration process.",
+            color=BrandColors.YELLOW,
             url=tx_url
         )
 
-        await ctx.send(f"You're about to register `{cured_name}`!", embeds=embed)
+        await ctx.send(f"You are about to begin a two-step registration process for `{cured_name}`.", embeds=embed, ephemeral=True)
         await listen_for_commit(
             commitment=commitment,
             interval_start=datetime.datetime.now(),
@@ -281,6 +289,6 @@ async def register(ctx: SlashContext, ens_name, eth_address):
             salt_bytes=salt_bytes
         )
     except DisallowedNameError as e:
-        await ctx.send(f"I apologize, but the name {ens_name} cannot be accepted for registration.")
+        await ctx.send(f"I apologize, but the name `{ens_name}` cannot be accepted for registration.", ephemeral=True)
 
 bot.start(namebazaarGPT_token)
