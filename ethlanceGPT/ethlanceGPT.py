@@ -7,6 +7,7 @@ import pinecone
 import time
 import datetime
 import logging
+from dotenv import load_dotenv
 
 # Add the parent directory to the import search path
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -78,13 +79,14 @@ If you would like to delete your current post, you can inform me using a similar
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ethlanceGPT")
 
+load_dotenv()
 # Get the value of environment variables
-ethlanceGPT_token = os.environ.get('ETHLANCE_GPT_TOKEN')
-ethlanceGPT_client_id = os.environ.get('ETHLANCE_GPT_CLIENT_ID')
-openai.api_key = os.environ.get('OPENAI_API_KEY')
-pinecone_api_key = os.environ.get('PINECONE_API_KEY')  # Add this line to retrieve Pinecone API key
-max_uses_per_day = os.environ.get('MAX_USES_PER_DAY')
-admin_user_id = os.environ.get('ADMIN_USER_ID')
+ethlanceGPT_token = os.getenv('ETHLANCE_GPT_TOKEN')
+ethlanceGPT_client_id = os.getenv('ETHLANCE_GPT_CLIENT_ID')
+openai.api_key = os.getenv('OPENAI_API_KEY')
+pinecone_api_key = os.getenv('PINECONE_API_KEY')  # Add this line to retrieve Pinecone API key
+max_uses_per_day = int(os.getenv('MAX_USES_PER_DAY'))
+admin_user_id = int(os.getenv('ADMIN_USER_ID'))
 
 pinecone.init(api_key=pinecone_api_key, environment="northamerica-northeast1-gcp")
 openai_embed_model = "text-embedding-ada-002"
