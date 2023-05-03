@@ -87,6 +87,7 @@ openai.api_key = os.getenv('OPENAI_API_KEY')
 pinecone_api_key = os.getenv('PINECONE_API_KEY')  # Add this line to retrieve Pinecone API key
 max_uses_per_day = int(os.getenv('MAX_USES_PER_DAY'))
 admin_user_id = int(os.getenv('ADMIN_USER_ID'))
+min_pinecone_score = float(os.getenv('MIN_PINECONE_SCORE'))
 
 pinecone.init(api_key=pinecone_api_key, environment="northamerica-northeast1-gcp")
 openai_embed_model = "text-embedding-ada-002"
@@ -100,7 +101,6 @@ intents.messages = True
 intents.guilds = True
 intents.message_content = True
 
-min_pinecone_score = 0.77
 max_prompt_length = 1000
 
 # Create an instance of APICounter with a maximum limit of 5 requests per day
