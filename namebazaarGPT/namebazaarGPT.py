@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-
 import openai
 import pinecone
 from dotenv import load_dotenv
@@ -33,7 +32,8 @@ tx_checking_interval = int(os.getenv('TX_CHECKING_INTERVAL'))
 
 contract_addresses = { # Make sure addresses are checksum format
     "mainnet": {
-        "ETHRegistrarController": "0x253553366da8546fc250f225fe3d25d0c782303b"
+        "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
+        "PublicResolver": "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41"
     },
     "goerli": {
         "ETHRegistrarController": "0xCc5e7dB10E65EED1BBD105359e7268aa660f6734",
@@ -44,9 +44,6 @@ contract_addresses = { # Make sure addresses are checksum format
 pinecone.init(api_key=pinecone_api_key, environment="northamerica-northeast1-gcp")
 openai_embed_model = "text-embedding-ada-002"
 pinecone_index_name = "namebazaar-gpt"
-
-pinecone_indexes = pinecone.list_indexes()
-logger.info(f"Pinecone indexes: {pinecone_indexes}")
 
 intents = Intents.DEFAULT
 intents.messages = True
