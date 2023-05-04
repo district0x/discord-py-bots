@@ -131,3 +131,5 @@ dmypy.json
 .pyre/
 /Scripts/
 /pyvenv.cfg
+/namebazaarGPT/transactions.db
+/namebazaarGPT/tx.db

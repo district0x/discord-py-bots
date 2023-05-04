@@ -9,9 +9,14 @@ import openai
 import pinecone
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
-from interactions import Client, Intents, slash_command, slash_option, SlashContext, OptionType
+from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType
 from interactions.models.discord import Embed, BrandColors
 from web3 import Web3
+from quart import Quart, request, jsonify
+import nest_asyncio
+from tx_db import TxDB
+import hashlib
+from quart_cors import cors
 
 load_dotenv()
 
@@ -26,11 +31,11 @@ max_uses_per_day = os.getenv('MAX_USES_PER_DAY')
 admin_user_id = os.getenv('ADMIN_USER_ID')
 infura_url = os.getenv('INFURA_URL')
 web3_network = os.getenv('WEB3_NETWORK')
-tx_page_host = os.getenv('TX_PAGE_HOST')
-bitly_api_key = os.getenv('BITLY_API_KEY')
-tx_checking_interval = int(os.getenv('TX_CHECKING_INTERVAL'))
+tx_page_url = os.getenv('TX_PAGE_URL')
+server_host = os.getenv('SERVER_HOST')
+server_port = os.getenv('SERVER_PORT')
 
-contract_addresses = { # Make sure addresses are checksum format
+contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
         "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
         "PublicResolver": "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41"
@@ -50,7 +55,7 @@ intents.messages = True
 intents.guilds = True
 intents.message_content = True
 
-guild_id = 356854079022039062
+tx_db = TxDB('tx.db')
 
 bot = Client(intents=intents)
 
@@ -81,8 +86,9 @@ def remove_eth_suffix(s: str) -> str:
         return s
 
 
-def get_tx_page_url(tx_data):
-    return f"{tx_page_host}?to={tx_data['to']}&data={tx_data['data']}&value={tx_data['value']}"
+def get_tx_page_url(tx_key, tx_data):
+    return f"{tx_page_url}?tx_key={tx_key}&to={tx_data['to']}&data={tx_data['data']}&value={tx_data['value']}" \
+           f"&host={server_host}&port={server_port}"
 
 
 web3 = Web3(Web3.WebsocketProvider(infura_url))
@@ -94,6 +100,10 @@ def less_hours_passed(start_time, hours):
     now = datetime.datetime.now()
     time_passed = now - start_time
     return time_passed < datetime.timedelta(hours=hours)
+
+
+def get_tx_key(tx_data):
+    return hashlib.sha256(f"{tx_data['to']}{tx_data['data']}{tx_data['value']}".encode()).hexdigest()[:32]
 
 
 async def listen_for_register(interval_start, name_label, owner, ctx):
@@ -113,80 +123,10 @@ async def listen_for_register(interval_start, name_label, owner, ctx):
         await asyncio.sleep(tx_checking_interval)
 
 
-
-async def listen_for_commit(
-        interval_start,
-        commitment,
-        name_label,
-        eth_address,
-        register_duration,
-        salt_bytes,
-        ctx):
-    while less_hours_passed(interval_start, 24):
-        commitment_timestamp = eth_registrar.functions.commitments(commitment).call()
-        logger.info(f"Commitment Timestamp...{commitment_timestamp}")
-
-        if commitment_timestamp > 0:
-            # Wait until commit period ends
-            await asyncio.sleep(65)
-
-            # Add 10% to account for price fluctuation; the difference is refunded.
-            rent_price_wei = eth_registrar.functions.rentPrice(name_label, register_duration).call()[0]
-            rent_price_wei = int(float(rent_price_wei) * 1.1)
-            rent_price_eth = web3.from_wei(rent_price_wei, "ether")
-
-            logger.info(f"rent price: {rent_price_eth}")
-            logger.info(f"name_label: {name_label}")
-            logger.info(f"eth_address: {eth_address}")
-            logger.info(f"register_duration: {register_duration}")
-            logger.info(f"salt_bytes: {hexlify(salt_bytes)}")
-            logger.info(f"resolver: {get_contract_address('PublicResolver')}")
-
-            tx_data = eth_registrar.functions.register(
-                name_label,
-                eth_address,
-                register_duration,
-                salt_bytes,
-                get_contract_address("PublicResolver"),
-                [],
-                False,
-                15
-            ).build_transaction({"value": rent_price_wei})
-
-            logger.info(tx_data)
-
-            tx_url = get_tx_page_url(tx_data)
-
-            ens_name = add_eth_suffix(name_label)
-
-            embed = Embed(
-                title=f"Finish Registration for `{ens_name}`",
-                description=f"To complete the registration process for `{ens_name}`, please click on the link provided above.\n"
-                            f"The ENS cost for 1 year registration is {round(rent_price_eth, 3)} ETH.\n"
-                            f"Upon selecting this option, the link will automatically launch in your web browser and "
-                            f"trigger the MetaMask extension or the app on the mobile.",
-                color=BrandColors.GREEN,
-                url=tx_url
-            )
-
-            await ctx.send(f"{ctx.author.mention} Great! Now you are just a step away from registering `{ens_name}`. ",
-                           embeds=embed,
-                           ephemeral=True)
-
-            await listen_for_register(
-                interval_start=datetime.datetime.now(),
-                name_label=name_label,
-                owner=eth_address,
-                ctx=ctx)
-            break
-
-        await asyncio.sleep(tx_checking_interval)
-
-
-
-@bot.event
+@listen()
 async def on_ready():
-    logger.info(f"Logged in as {bot.user.name}")
+    # ready events pass no data, so dont have params
+    logger.info("Bot is ready")
 
 
 @slash_command(name="buy", description="My first buy command :)")
@@ -204,14 +144,14 @@ async def buy(ctx: SlashContext):
     min_length=3
 )
 @slash_option(
-    name="eth_address",
+    name="owner_address",
     description="Please provide the Ethereum address you wish to register an ENS name with.",
     required=True,
     opt_type=OptionType.STRING,
     max_length=42,
     min_length=42
 )
-async def register(ctx: SlashContext, ens_name, eth_address):
+async def register(ctx: SlashContext, ens_name, owner_address):
     register_duration = 31536000
     logger.info(f"register {ens_name}")
     try:
@@ -219,7 +159,7 @@ async def register(ctx: SlashContext, ens_name, eth_address):
         cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
 
-        if not Web3.is_checksum_address(eth_address):
+        if not Web3.is_checksum_address(owner_address):
             await ctx.send(f"It appears that the Ethereum address you provided is not valid. "
                            f"Please provide the address in checksum format", ephemeral=True)
             return
@@ -235,21 +175,15 @@ async def register(ctx: SlashContext, ens_name, eth_address):
         logger.info(f"available: {is_available}")
 
         if not is_available:
-            await ctx.send(f"I apologize, but the name `{cured_name}` is not available for registration.", ephemeral=True)
+            await ctx.send(f"I apologize, but the name `{cured_name}` is not available for registration.",
+                           ephemeral=True)
             return
 
-        salt = os.urandom(32).hex()
-        salt_bytes = bytes.fromhex(salt)
-
-        logger.info(f"label: {name_label}")
-        logger.info(f"eth_address: {eth_address}")
-        logger.info(f"register_duration: {register_duration}")
-        logger.info(f"salt_bytes: {salt_bytes}")
-        logger.info(f"address: {get_contract_address('PublicResolver')}")
+        salt_bytes = os.urandom(32)
 
         commitment = eth_registrar.functions.makeCommitment(
             name_label,
-            eth_address,
+            owner_address,
             register_duration,
             salt_bytes,
             get_contract_address("PublicResolver"),
@@ -262,7 +196,21 @@ async def register(ctx: SlashContext, ens_name, eth_address):
 
         tx_data = eth_registrar.functions.commit(commitment).build_transaction()
 
-        tx_url = get_tx_page_url(tx_data)
+        logger.info(tx_data)
+
+        tx_key = get_tx_key(tx_data)
+        tx_url = get_tx_page_url(tx_key, tx_data)
+
+        tx_db.add_tx({"tx_key": tx_key,
+                      "user": ctx.author_id,
+                      "action": "commit",
+                      "channel": ctx.channel_id,
+                      "next_action_data": json.dumps({"name_label": name_label,
+                                                      "owner_address": owner_address,
+                                                      "register_duration": register_duration,
+                                                      "salt_hex": salt_bytes.hex()})})
+
+        logger.info(f"tx added {tx_key}")
 
         embed = Embed(
             title=f"Begin Registration for `{cured_name}`",
@@ -272,20 +220,42 @@ async def register(ctx: SlashContext, ens_name, eth_address):
                         f"the MetaMask installed.\n"
                         f"You will be notified once we are ready to proceed with the second step of the registration process.",
             color=BrandColors.YELLOW,
-            url=tx_url
-        )
+            url=tx_url)
 
-        await ctx.send(f"You are about to begin a two-step registration process for `{cured_name}`.", embeds=embed, ephemeral=True)
-        await listen_for_commit(
-            commitment=commitment,
-            interval_start=datetime.datetime.now(),
-            ctx=ctx,
-            name_label=name_label,
-            eth_address=eth_address,
-            register_duration=register_duration,
-            salt_bytes=salt_bytes
-        )
+        await ctx.send(f"You are about to begin a two-step registration process for `{cured_name}`.", embeds=embed,
+                       ephemeral=True)
+
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` cannot be accepted for registration.", ephemeral=True)
+    except Exception as e:
+        # Handle the exception here
+        logger.info(f"REGISTER EXCEPTION {str(e)}")
+        await ctx.respond('An error occurred: {}'.format(str(e)))
 
-bot.start(namebazaarGPT_token)
+
+app = Quart(__name__)
+app = cors(app, allow_origin="*") # reconsider this in prod
+
+@app.route('/tx', methods=['POST'])
+async def user_post():
+    data = await request.data
+    logger.info(f'Received POST data: {data}')
+    return jsonify({"status": "success", "data": "hello"})
+
+
+async def main():
+    nest_asyncio.apply()
+    tasks = [
+        asyncio.create_task(app.run_task(host=server_host, port=server_port)),
+        asyncio.create_task(bot.start(namebazaarGPT_token))
+    ]
+    await asyncio.gather(*tasks)
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        bot.stop()

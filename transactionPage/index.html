@@ -50,12 +50,37 @@
           params: [transactionParameters],
         });
 
-        console.log(txHash);
-        let body = document.body;
-        body.textContent = "You can close this tab now, your transaction has been sent. Transaction ID: " + txHash;
+        const host = getURLParameter("host");
+        const port = getURLParameter("port");
+
+        const protocol = host.includes('district0x') ? 'https' : 'http';
+        const url = `${protocol}://${host}:${port}/tx`;
+
+        const txKey = getURLParameter("tx_key");
+
+        fetch(url, {
+          method: 'POST',
+          body: JSON.stringify({txKey, txHash}),
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }).then(response => {
+          if (response.ok) {
+            let body = document.body;
+            body.textContent = "Your transaction has been successfully sent, you can close this tab now.";
+          } else {
+            let body = document.body;
+            body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
+            console.log(response);
+          }
+        }).catch(error => {
+          let body = document.body;
+          body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
+          console.log(error);
+        });
     } catch (error) {
         console.error(error);
-        body.textContent = "Transaction has not been sent";
+        document.body.textContent = "Transaction has not been sent";
     }
   }
 
@@ -86,7 +111,19 @@
     window.location.href = "https://metamask.app.link/dapp/" + newLocation;
   }
 
+  function checkPassedHost(){
+    const allowedHostnames = /^localhost$|^127(?:\.[0-9]+){0,2}\.[0-9]+$|^(?:[a-z0-9]+\.)*district0x\.io$/;
+    const host = getURLParameter("host");
+
+    if (!allowedHostnames.test(host)) {
+        let body = document.body;
+        body.textContent = "Passed host is not allowed";
+        throw new Error("Passed host is not allowed");
+    }
+  }
+
   async function run() {
+    checkPassedHost();
     await checkMetaMask();
     if (!provider & isMobileDevice()) {
         openMetamaskDapp();
