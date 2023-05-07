@@ -12,7 +12,7 @@ from ens_normalize import ens_cure, DisallowedNameError
 from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType
 from interactions.models.discord import Embed, BrandColors
 from web3 import Web3
-from quart import Quart, request, jsonify
+from quart import Quart, request, jsonify, abort
 import nest_asyncio
 from tx_db import TxDB
 import hashlib
@@ -58,7 +58,6 @@ intents.message_content = True
 tx_db = TxDB('tx.db')
 
 bot = Client(intents=intents)
-
 
 def hexlify(name):
     return binascii.hexlify(name).decode('utf-8')
@@ -202,7 +201,7 @@ async def register(ctx: SlashContext, ens_name, owner_address):
         tx_url = get_tx_page_url(tx_key, tx_data)
 
         tx_db.add_tx({"tx_key": tx_key,
-                      "user": ctx.author_id,
+                      "user": ctx.author.mention,
                       "action": "commit",
                       "channel": ctx.channel_id,
                       "next_action_data": json.dumps({"name_label": name_label,
@@ -233,6 +232,46 @@ async def register(ctx: SlashContext, ens_name, owner_address):
         await ctx.respond('An error occurred: {}'.format(str(e)))
 
 
+async def send_register_finish_url(name_label, register_duration, owner_address, salt_bytes, ctx_author, ctx_channel):
+    # Add 10% to account for price fluctuation; the difference is refunded.
+    rent_price_wei = eth_registrar.functions.rentPrice(name_label, register_duration).call()[0]
+    rent_price_wei = int(float(rent_price_wei) * 1.1)
+    rent_price_eth = web3.from_wei(rent_price_wei, "ether")
+
+    tx_data = eth_registrar.functions.register(
+        name_label,
+        owner_address,
+        register_duration,
+        salt_bytes,
+        get_contract_address("PublicResolver"),
+        [],
+        False,
+        15
+    ).build_transaction({"value": rent_price_wei})
+
+    logger.info(tx_data)
+
+    tx_url = get_tx_page_url(tx_data)
+
+    ens_name = add_eth_suffix(name_label)
+
+    embed = Embed(
+        title=f"Finish Registration for `{ens_name}`",
+        description=f"To complete the registration process for `{ens_name}`, please click on the link provided above.\n"
+                    f"The ENS cost for 1 year registration is {round(rent_price_eth, 3)} ETH.\n"
+                    f"Upon selecting this option, the link will automatically launch in your web browser and "
+                    f"trigger the MetaMask extension or the app on the mobile.",
+        color=BrandColors.GREEN,
+        url=tx_url
+    )
+
+    channel = bot.get_channel(int(tx["channel"]))
+
+    await channel.send(f"{ctx_author} Great! Now you are just a step away from registering `{ens_name}`. ",
+                   embeds=embed,
+                   ephemeral=True)
+
+
 app = Quart(__name__)
 app = cors(app, allow_origin="*") # reconsider this in prod
 
@@ -240,7 +279,27 @@ app = cors(app, allow_origin="*") # reconsider this in prod
 async def user_post():
     data = await request.data
     logger.info(f'Received POST data: {data}')
-    return jsonify({"status": "success", "data": "hello"})
+    tx_key = data["tx_key"]
+    tx_hash = data["tx_hash"]
+
+    if not tx_key or not tx_hash or not tx_db.tx_key_exists(tx_key):
+        abort(400, description='Transaction key is invalid')
+
+    tx_db.update_tx_hash(tx_key)
+    tx = tx_db.get_tx(tx_key)
+
+    next_action_data = json.loads(tx["next_action_data"])
+
+    if tx["action"] == "commit":
+        await send_register_finish_url(name_label=next_action_data["name_label"],
+                                       register_duration=next_action_data["register_duration"],
+                                       owner_address=next_action_data["owner_address"],
+                                       salt_bytes=bytes.fromhex(next_action_data["salt_bytes"]),
+                                       ctx_channel=int(tx["channel"]),
+                                       ctx_author=tx["user"])
+
+    return jsonify({"status": "success"})
+
 
 
 async def main():
