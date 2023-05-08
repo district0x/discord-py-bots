@@ -2,7 +2,7 @@ name: docker_push
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "test_ci" ]
 
 permissions:
   contents: read
@@ -43,7 +43,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ github.sha }}
+          tags: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ github.sha }},${{ secrets.ECR_REGISTRY }}/discord-py-bots:latest
 
 
 
