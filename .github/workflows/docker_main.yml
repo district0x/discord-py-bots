@@ -2,7 +2,7 @@ name: docker_push
 
 on:
   push:
-    branches: [ "test_ci" ]
+    branches: [ "master" ]
 
 permissions:
   contents: read
