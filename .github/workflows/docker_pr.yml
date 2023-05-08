@@ -1,8 +1,8 @@
-name: build
+name: docker_test
 
 on:
   pull_request:
-    branches: ["test_ci"]
+    branches: ["master"]
 
 permissions:
   contents: read
@@ -26,35 +26,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Build and push
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ github.sha }}
-
-      # - name: Build an image from Dockerfile
-      #   env:
-      #     ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-      #   run: |
-      #     docker build -t ${ECR_REGISTRY}/discord-py-bots:${{ github.sha }} .
+      - name: Build an image from Dockerfile
+        run: |
+          docker build -t discord-py-bots:${{ github.sha }} .
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ github.sha }}
+          image-ref: discord-py-bots:${{ github.sha }}
           format: "template"
           template: "@/contrib/sarif.tpl"
           output: "trivy-results.sarif"
