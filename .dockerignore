@@ -1,0 +1,8 @@
+.git
+.gitignore
+.coverage
+.coverage.*
+.env
+.aws
+README.md
+Dockerfile
