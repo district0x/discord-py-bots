@@ -59,6 +59,7 @@ tx_db = TxDB('tx.db')
 
 bot = Client(intents=intents)
 
+
 def hexlify(name):
     return binascii.hexlify(name).decode('utf-8')
 
@@ -105,21 +106,20 @@ def get_tx_key(tx_data):
     return hashlib.sha256(f"{tx_data['to']}{tx_data['data']}{tx_data['value']}".encode()).hexdigest()[:32]
 
 
-async def listen_for_register(interval_start, name_label, owner, ctx):
-    label_hash = Web3.keccak(name_label.encode("utf-8"))
-    event_filter = eth_registrar.events.NameRegistered.create_filter(
-        fromBlock="latest",
-        argument_filters={"label": label_hash, "owner": owner}
-    )
-    while less_hours_passed(interval_start, 72):
-        events = event_filter.get_new_entries()
-        logger.info(f"register events: {events}")
-        if events:
-            ens_name = add_eth_suffix(name_label)
-            await ctx.send(f"Congratulations, {ctx.author.mention}! You are now the proud owner of `{ens_name}`.")
-            break
-
-        await asyncio.sleep(tx_checking_interval)
+async def wait_for_receipt(tx_hash: str) -> dict:
+    receipt = None
+    start = datetime.datetime.now()
+    while receipt is None and less_hours_passed(start, 24):
+        try:
+            receipt = web3.eth.get_transaction_receipt(tx_hash)
+        except ValueError:
+            logger.error(f"Invalid transaction hash {tx_hash}")
+        except Exception as e:
+            # Thows exception when transaction hash is not yet found
+            await asyncio.sleep(15)
+            continue
+        await asyncio.sleep(15)
+    return receipt
 
 
 @listen()
@@ -153,7 +153,9 @@ async def buy(ctx: SlashContext):
 async def register(ctx: SlashContext, ens_name, owner_address):
     register_duration = 31536000
     logger.info(f"register {ens_name}")
+
     try:
+
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
@@ -191,7 +193,8 @@ async def register(ctx: SlashContext, ens_name, owner_address):
             15
         ).call()
 
-        logger.info(f"commitment: {commitment}")
+        logger.info(f"salt_bytes: {salt_bytes}")
+        logger.info(f"salt_hex: {salt_bytes.hex()}")
 
         tx_data = eth_registrar.functions.commit(commitment).build_transaction()
 
@@ -208,8 +211,6 @@ async def register(ctx: SlashContext, ens_name, owner_address):
                                                       "owner_address": owner_address,
                                                       "register_duration": register_duration,
                                                       "salt_hex": salt_bytes.hex()})})
-
-        logger.info(f"tx added {tx_key}")
 
         embed = Embed(
             title=f"Begin Registration for `{cured_name}`",
@@ -232,74 +233,126 @@ async def register(ctx: SlashContext, ens_name, owner_address):
         await ctx.respond('An error occurred: {}'.format(str(e)))
 
 
-async def send_register_finish_url(name_label, register_duration, owner_address, salt_bytes, ctx_author, ctx_channel):
-    # Add 10% to account for price fluctuation; the difference is refunded.
-    rent_price_wei = eth_registrar.functions.rentPrice(name_label, register_duration).call()[0]
-    rent_price_wei = int(float(rent_price_wei) * 1.1)
-    rent_price_eth = web3.from_wei(rent_price_wei, "ether")
+async def send_register_finish_url(
+        name_label, register_duration, owner_address, salt_bytes, ctx_author, ctx_channel):
+    try:
+        # Add 10% to account for price fluctuation; the difference is refunded.
+        rent_price_wei = eth_registrar.functions.rentPrice(name_label, register_duration).call()[0]
+        rent_price_wei = int(float(rent_price_wei) * 1.1)
+        rent_price_eth = web3.from_wei(rent_price_wei, "ether")
 
-    tx_data = eth_registrar.functions.register(
-        name_label,
-        owner_address,
-        register_duration,
-        salt_bytes,
-        get_contract_address("PublicResolver"),
-        [],
-        False,
-        15
-    ).build_transaction({"value": rent_price_wei})
+        tx_data = eth_registrar.functions.register(
+            name_label,
+            owner_address,
+            register_duration,
+            salt_bytes,
+            get_contract_address("PublicResolver"),
+            [],
+            False,
+            15
+        ).build_transaction({"value": rent_price_wei})
 
-    logger.info(tx_data)
+        logger.info(tx_data)
 
-    tx_url = get_tx_page_url(tx_data)
+        tx_key = get_tx_key(tx_data)
+        tx_url = get_tx_page_url(tx_key, tx_data)
 
-    ens_name = add_eth_suffix(name_label)
+        ens_name = add_eth_suffix(name_label)
 
-    embed = Embed(
-        title=f"Finish Registration for `{ens_name}`",
-        description=f"To complete the registration process for `{ens_name}`, please click on the link provided above.\n"
-                    f"The ENS cost for 1 year registration is {round(rent_price_eth, 3)} ETH.\n"
-                    f"Upon selecting this option, the link will automatically launch in your web browser and "
-                    f"trigger the MetaMask extension or the app on the mobile.",
-        color=BrandColors.GREEN,
-        url=tx_url
-    )
+        tx_db.add_tx({"tx_key": tx_key,
+                      "user": ctx_author,
+                      "action": "register",
+                      "channel": ctx_channel,
+                      "next_action_data": json.dumps({"ens_name": ens_name,
+                                                      "owner_address": owner_address})})
 
-    channel = bot.get_channel(int(tx["channel"]))
+        embed = Embed(
+            title=f"Finish Registration for `{ens_name}`",
+            description=f"To complete the registration process for `{ens_name}`, please click on the link provided above.\n"
+                        f"The ENS cost for 1 year registration is {round(rent_price_eth, 3)} ETH.\n"
+                        f"Upon selecting this option, the link will automatically launch in your web browser and "
+                        f"trigger the MetaMask extension or the app on the mobile.",
+            color=BrandColors.GREEN,
+            url=tx_url
+        )
 
-    await channel.send(f"{ctx_author} Great! Now you are just a step away from registering `{ens_name}`. ",
-                   embeds=embed,
-                   ephemeral=True)
+        channel = bot.get_channel(ctx_channel)
+
+        await channel.send(f"{ctx_author} Great! Now you are just a step away from registering `{ens_name}`. ",
+                           embeds=embed,
+                           ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in send_register_finish_url {str(e)}")
+        raise e
+
+
+async def send_register_congrats(ens_name, owner_address, salt_bytes, ctx_author, ctx_channel):
+    logger.info(f"gonna send congrats")
+    # try:
+    #     logger.info(f"gonna send congrats")
+    #     channel = bot.get_channel(ctx_channel)
+    #
+    #     logger.info(f"channel: {channel}")
+    #
+    #     await channel.send(f"Congratulations! {ctx_author} is now the proud owner of `{ens_name}`!")
+    # except Exception as e:
+    #     logger.error(f"Error in send_register_finish_url {str(e)}")
+    #     raise e
+
+
+async def action_commit(tx, tx_hash, next_action_data):
+    # Run tasks in sequence using
+    logger.info("action commit")
+    await wait_for_receipt(tx_hash)
+    logger.info("receipt found!")
+    await asyncio.sleep(61)  # The second step of the registration can be done only after 60 seconds
+    logger.info("sleep is over")
+    await send_register_finish_url(name_label=next_action_data["name_label"],
+                                   register_duration=int(next_action_data["register_duration"]),
+                                   owner_address=next_action_data["owner_address"],
+                                   salt_bytes=bytes.fromhex(next_action_data["salt_hex"]),
+                                   ctx_channel=int(tx["channel"]),
+                                   ctx_author=tx["user"])
+
+
+async def action_register(tx, tx_hash, next_action_data):
+    logger.info("action register")
+    await wait_for_receipt(tx_hash)
+    logger.info(f"before send_register_congrats")
+    await send_register_congrats(ens_name=next_action_data["ens_name"],
+                                 owner_address=next_action_data["owner_address"],
+                                 ctx_channel=int(tx["channel"]),
+                                 ctx_author=tx["user"])
 
 
 app = Quart(__name__)
-app = cors(app, allow_origin="*") # reconsider this in prod
+app = cors(app, allow_origin="*")  # reconsider this in prod
+
 
 @app.route('/tx', methods=['POST'])
 async def user_post():
     data = await request.data
-    logger.info(f'Received POST data: {data}')
-    tx_key = data["tx_key"]
-    tx_hash = data["tx_hash"]
+    json_data = json.loads(data.decode())
+    logger.info(f'Received POST data: {json_data}')
+    tx_key = json_data["txKey"]
+    tx_hash = json_data["txHash"]
 
     if not tx_key or not tx_hash or not tx_db.tx_key_exists(tx_key):
         abort(400, description='Transaction key is invalid')
 
-    tx_db.update_tx_hash(tx_key)
+    tx_db.update_tx_hash(tx_key, tx_hash)
     tx = tx_db.get_tx(tx_key)
+
+    logger.info(f'TX {tx}')
 
     next_action_data = json.loads(tx["next_action_data"])
 
     if tx["action"] == "commit":
-        await send_register_finish_url(name_label=next_action_data["name_label"],
-                                       register_duration=next_action_data["register_duration"],
-                                       owner_address=next_action_data["owner_address"],
-                                       salt_bytes=bytes.fromhex(next_action_data["salt_bytes"]),
-                                       ctx_channel=int(tx["channel"]),
-                                       ctx_author=tx["user"])
+        asyncio.create_task(action_commit(tx, tx_hash, next_action_data))
+    elif tx["action"] == "register":
+        asyncio.create_task(action_register(tx, tx_hash, next_action_data))
 
     return jsonify({"status": "success"})
-
 
 
 async def main():
