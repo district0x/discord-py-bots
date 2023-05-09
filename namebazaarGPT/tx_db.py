@@ -35,8 +35,12 @@ class TxDB:
             ''', (tx['tx_key'], tx['user'], tx['action'], tx['channel'], tx['next_action_data']))
             conn.commit()
 
+    def _dict_factory(self, cursor, row):
+        return dict(zip([col[0] for col in cursor.description], row))
+
     def get_tx(self, tx_key):
         with sqlite3.connect(self.db_file) as conn:
+            conn.row_factory = self._dict_factory
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT * FROM tx WHERE tx_key = ?
@@ -45,6 +49,7 @@ class TxDB:
 
     def get_txs_by_user_action(self, user, action):
         with sqlite3.connect(self.db_file) as conn:
+            conn.row_factory = self._dict_factory
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT * FROM tx WHERE user = ? AND action = ?
