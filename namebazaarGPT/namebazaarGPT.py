@@ -17,6 +17,7 @@ import nest_asyncio
 from tx_db import TxDB
 import hashlib
 from quart_cors import cors
+import httpx
 
 load_dotenv()
 
@@ -27,6 +28,7 @@ namebazaarGPT_token = os.getenv('NAMEBAZAAR_GPT_TOKEN')
 namebazaarGPT_client_id = os.getenv('NAMEBAZAAR_GPT_CLIENT_ID')
 openai.api_key = os.getenv('OPENAI_API_KEY')
 pinecone_api_key = os.getenv('PINECONE_API_KEY')
+opensea_api_key = os.getenv('OPENSEA_API_KEY')
 max_uses_per_day = os.getenv('MAX_USES_PER_DAY')
 admin_user_id = os.getenv('ADMIN_USER_ID')
 infura_url = os.getenv('INFURA_URL')
@@ -38,11 +40,22 @@ server_port = os.getenv('SERVER_PORT')
 contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
         "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
+        "ETHRegistrar": "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85",
         "PublicResolver": "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41"
     },
     "goerli": {
         "ETHRegistrarController": "0xCc5e7dB10E65EED1BBD105359e7268aa660f6734",
+        "ETHRegistrar": "0xf7a220ad9d818cd3083a57b321f0473cd92dc73d",
         "PublicResolver": "0x19c2d5D0f035563344dBB7bE5fD09c8dad62b001"
+    }
+}
+
+opeansea_urls = {
+    "mainnet" : {
+        "listings": "https://api.opensea.io/v2/orders/ethereum/seaport/listings"
+    },
+    "goerli": {
+        "listings" : "https://testnets-api.opensea.io/v2/orders/goerli/seaport/listings"
     }
 }
 
@@ -71,6 +84,10 @@ def get_abi(contract_name):
 
 def get_contract_address(contract_name):
     return contract_addresses[web3_network][contract_name]
+
+
+def get_opensea_url(endpoint):
+    return opeansea_urls[web3_network][endpoint]
 
 
 def add_eth_suffix(ens_name):
@@ -128,9 +145,48 @@ async def on_ready():
     logger.info("Bot is ready")
 
 
-@slash_command(name="buy", description="My first buy command :)")
-async def buy(ctx: SlashContext):
-    await ctx.send("You have just bought ENS name!")
+@slash_command(name="buy", description="Buy ENS name")
+@slash_option(
+    name="ens_name",
+    description="Please provide the ENS name that you wish to buy.",
+    required=True,
+    opt_type=OptionType.STRING,
+    max_length=100,
+    min_length=3
+)
+async def buy(ctx: SlashContext, ens_name):
+    try:
+        ens_name = add_eth_suffix(ens_name)
+        cured_name = ens_cure(ens_name)
+        name_label = remove_eth_suffix(cured_name)
+
+        label_hash = Web3.keccak(text=name_label)
+        token_id = int.from_bytes(label_hash, byteorder='big')
+        logger.info(f"token id: {token_id}")
+
+        headers = {
+            "accept": "application/json",
+            "X-API-KEY": opensea_api_key
+        }
+
+        url = f"{get_opensea_url('listings')}?" \
+              f"asset_contract_address={get_contract_address('ETHRegistrar')}&" \
+              f"token_ids={token_id}"
+
+        client = httpx.AsyncClient()
+
+        response = await client.get(url, headers=headers)
+
+        logger.info(f"response: {response.text}")
+
+        await ctx.send(f"{response.text}")
+
+    except DisallowedNameError as e:
+        await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Buy command exception {str(e)}")
+        raise e
+
 
 
 @slash_command(name="register", description="Registers ENS name")
@@ -155,7 +211,6 @@ async def register(ctx: SlashContext, ens_name, owner_address):
     logger.info(f"register {ens_name}")
 
     try:
-
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
@@ -286,43 +341,45 @@ async def send_register_finish_url(
         raise e
 
 
-async def send_register_congrats(ens_name, owner_address, salt_bytes, ctx_author, ctx_channel):
-    logger.info(f"gonna send congrats")
-    # try:
-    #     logger.info(f"gonna send congrats")
-    #     channel = bot.get_channel(ctx_channel)
-    #
-    #     logger.info(f"channel: {channel}")
-    #
-    #     await channel.send(f"Congratulations! {ctx_author} is now the proud owner of `{ens_name}`!")
-    # except Exception as e:
-    #     logger.error(f"Error in send_register_finish_url {str(e)}")
-    #     raise e
+async def send_register_congrats(ens_name, owner_address, ctx_author, ctx_channel):
+    try:
+        channel = bot.get_channel(ctx_channel)
+        await channel.send(f"Great news! `{ens_name}` is now owned by {ctx_author}, who can now proudly call it their own!")
+    except Exception as e:
+        logger.error(f"Error in send_register_finish_url {str(e)}")
+        raise e
 
 
 async def action_commit(tx, tx_hash, next_action_data):
-    # Run tasks in sequence using
-    logger.info("action commit")
-    await wait_for_receipt(tx_hash)
-    logger.info("receipt found!")
-    await asyncio.sleep(61)  # The second step of the registration can be done only after 60 seconds
-    logger.info("sleep is over")
-    await send_register_finish_url(name_label=next_action_data["name_label"],
-                                   register_duration=int(next_action_data["register_duration"]),
-                                   owner_address=next_action_data["owner_address"],
-                                   salt_bytes=bytes.fromhex(next_action_data["salt_hex"]),
-                                   ctx_channel=int(tx["channel"]),
-                                   ctx_author=tx["user"])
+    try:
+        # Run tasks in sequence using
+        logger.info("action commit")
+        await wait_for_receipt(tx_hash)
+        logger.info("receipt found!")
+        await asyncio.sleep(61)  # The second step of the registration can be done only after 60 seconds
+        logger.info("sleep is over")
+        await send_register_finish_url(name_label=next_action_data["name_label"],
+                                       register_duration=int(next_action_data["register_duration"]),
+                                       owner_address=next_action_data["owner_address"],
+                                       salt_bytes=bytes.fromhex(next_action_data["salt_hex"]),
+                                       ctx_channel=int(tx["channel"]),
+                                       ctx_author=tx["user"])
+    except Exception as e:
+        logger.error(f"Error in action_commit {str(e)}")
+        raise e
 
 
 async def action_register(tx, tx_hash, next_action_data):
-    logger.info("action register")
-    await wait_for_receipt(tx_hash)
-    logger.info(f"before send_register_congrats")
-    await send_register_congrats(ens_name=next_action_data["ens_name"],
-                                 owner_address=next_action_data["owner_address"],
-                                 ctx_channel=int(tx["channel"]),
-                                 ctx_author=tx["user"])
+    try:
+        await wait_for_receipt(tx_hash)
+        await send_register_congrats(ens_name=next_action_data["ens_name"],
+                                     owner_address=next_action_data["owner_address"],
+                                     ctx_channel=int(tx["channel"]),
+                                     ctx_author=tx["user"])
+    except Exception as e:
+        logger.error(f"Error in action_register {str(e)}")
+        raise e
+
 
 
 app = Quart(__name__)
