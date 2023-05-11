@@ -42,7 +42,8 @@ contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
         "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
         "ETHRegistrar": "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85",
-        "PublicResolver": "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41"
+        "PublicResolver": "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41",
+        "Seaport": "0x00000000000001ad428e4906aE43D8F9852d0dD6"
     },
     "goerli": {
         "ETHRegistrarController": "0xCc5e7dB10E65EED1BBD105359e7268aa660f6734",
@@ -141,6 +142,23 @@ async def wait_for_receipt(tx_hash: str) -> dict:
     return receipt
 
 
+def prepare_tx_parameters(parameters):
+    for key in parameters:
+        if isinstance(parameters[key], str):
+            if parameters[key].isdigit():
+                # Convert numeric strings to integers
+                parameters[key] = int(parameters[key])
+            elif parameters[key].startswith('0x') and len(parameters[key]) == 42:
+                parameters[key] = Web3.to_checksum_address(parameters[key])
+                # Convert hex strings to bytes
+                # parameters[key] = bytes.fromhex(parameters[key][2:])
+        elif isinstance(parameters[key], list):
+            # Recursively prepare parameters in lists
+            parameters[key] = [prepare_tx_parameters(param) if isinstance(param, dict) else param for param in parameters[key]]
+    return parameters
+
+seaport_abi = get_abi("Seaport")
+
 @listen()
 async def on_ready():
     # ready events pass no data, so dont have params
@@ -179,10 +197,10 @@ async def buy(ctx: SlashContext, ens_name):
 
         response = await client.get(url, headers=headers)
 
-        parsed_json = json.loads(response.text)
-        formatted_json = json.dumps(parsed_json, indent=4)
+        listings = json.loads(response.text)
+        formatted_json = json.dumps(listings, indent=4)
 
-        if not parsed_json["orders"]:
+        if not listings["orders"]:
             await ctx.send(f"It appears that `{ens_name}` is not currently listed for sale on OpenSea.", ephemeral=True)
             return
 
@@ -190,19 +208,71 @@ async def buy(ctx: SlashContext, ens_name):
 
         payload = {
             "listing": {
-                "hash": parsed_json["orders"][0]["order_hash"],
+                "hash": listings["orders"][0]["order_hash"],
                 "chain": "ethereum",
-                "protocol_address": parsed_json["orders"][0]["protocol_address"]
+                "protocol_address": listings["orders"][0]["protocol_address"]
             },
             "fulfiller": {
                 "address": "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
             }
         }
 
+        logger.info(f'order hash: {listings["orders"][0]["order_hash"]}')
+
         response = await client.post(url, json=payload, headers=headers)
 
-        parsed_json = json.loads(response.text)
-        formatted_json = json.dumps(parsed_json, indent=4)
+        fulfillment = json.loads(response.text)
+
+        # if fulfillment["protocol"] != "seaport1.4":
+        #     await ctx.send(f"We have detected an unsupported protocol `{fulfillment['protocol']}`. "
+        #                    f"Please get in touch with our administrator for further assistance.")
+        #     return
+
+        # tx_data = fulfill_order(tuple(list(parameters.values()))).build_transaction({"value": fulfillment["fulfillment_data"]["transaction"]["value"]})
+
+        # raw_params = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
+        # parameters = prepare_tx_parameters(raw_params)
+
+        seaport = web3.eth.contract(address=Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"]),
+                                    abi=seaport_abi)
+
+        logger.info(f'to: {Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])}')
+
+
+        logger.info(seaport.functions.information().call())
+
+
+        fulfill_order = seaport.get_function_by_signature(fulfillment["fulfillment_data"]["transaction"]["function"])
+
+        # fulfillment["fulfillment_data"]["transaction"]["function"] is fulfillBasicOrder_efficient_6GL6yc((address,uint256,uint256,address,address,address,uint256,uint256,uint8,uint256,uint256,bytes32,uint256,bytes32,bytes32,uint256,(uint256,address)[],bytes))
+
+        tx_data = fulfill_order(
+            (  # Start of the first tuple
+                '0x0000000000000000000000000000000000000000',  # address
+                0,  # uint256
+                321750000000000,  # uint256
+                '0x51897B15AC5F1818E6B0a135E83780f42FcD504f',  # address
+                '0x004C00500000aD104D7DBd00e3ae0A5C00560C00',  # address
+                '0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85',  # address
+                28664633529144022433247423447362439793067709604106387165157380473597224346952,  # uint256
+                1,  # uint256
+                0,  # uint8
+                1683819094,  # uint256
+                1685932007,  # uint256
+                '0x0000000000000000000000000000000000000000000000000000000000000000',  # bytes32
+                24446860302761739304752683030156737591518664810215442929807674606410114351460,  # uint256
+                '0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000',  # bytes32
+                '0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000',  # bytes32
+                1,  # uint256
+                [(8250000000000, '0x0000a26b00c1F0DF003000390027140000fAa719')],  # (uint256,address)[]
+                '0x24b44ea06a12d93de67c44f9558d9bc0504af5059944af92ea96351821107485552c825523d9e091409667c64a4ee70ba78a113c30743daebe9c6f6bf0bb16a8'
+            ),  # End of the first tuple
+            # bytes
+        ).build_transaction({"value": int(fulfillment["fulfillment_data"]["transaction"]["value"])})
+
+        logger.info(tx_data)
+
+        formatted_json = json.dumps(fulfillment, indent=4)
 
         string_io = io.StringIO(formatted_json)
         string_as_file = File(file=string_io, file_name="myfile.txt")
