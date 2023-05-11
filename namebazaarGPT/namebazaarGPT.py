@@ -9,7 +9,7 @@ import openai
 import pinecone
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
-from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType
+from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, File
 from interactions.models.discord import Embed, BrandColors
 from web3 import Web3
 from quart import Quart, request, jsonify, abort
@@ -18,6 +18,7 @@ from tx_db import TxDB
 import hashlib
 from quart_cors import cors
 import httpx
+import io
 
 load_dotenv()
 
@@ -52,7 +53,8 @@ contract_addresses = {  # Make sure addresses are checksum format
 
 opeansea_urls = {
     "mainnet" : {
-        "listings": "https://api.opensea.io/v2/orders/ethereum/seaport/listings"
+        "listings": "https://api.opensea.io/v2/orders/ethereum/seaport/listings",
+        "fulfillment": "https://api.opensea.io/v2/listings/fulfillment_data"
     },
     "goerli": {
         "listings" : "https://testnets-api.opensea.io/v2/orders/goerli/seaport/listings"
@@ -177,15 +179,41 @@ async def buy(ctx: SlashContext, ens_name):
 
         response = await client.get(url, headers=headers)
 
-        logger.info(f"response: {response.text}")
+        parsed_json = json.loads(response.text)
+        formatted_json = json.dumps(parsed_json, indent=4)
 
-        await ctx.send(f"{response.text}")
+        if not parsed_json["orders"]:
+            await ctx.send(f"It appears that `{ens_name}` is not currently listed for sale on OpenSea.", ephemeral=True)
+            return
+
+        url = get_opensea_url("fulfillment")
+
+        payload = {
+            "listing": {
+                "hash": parsed_json["orders"][0]["order_hash"],
+                "chain": "ethereum",
+                "protocol_address": parsed_json["orders"][0]["protocol_address"]
+            },
+            "fulfiller": {
+                "address": "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
+            }
+        }
+
+        response = await client.post(url, json=payload, headers=headers)
+
+        parsed_json = json.loads(response.text)
+        formatted_json = json.dumps(parsed_json, indent=4)
+
+        string_io = io.StringIO(formatted_json)
+        string_as_file = File(file=string_io, file_name="myfile.txt")
+
+        await ctx.send(f"Here OpenSea response for `{ens_name}`:", files=[string_as_file])
 
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of {ens_name}.", ephemeral=True)
         logger.error(f"Buy command exception {str(e)}")
-        raise e
 
 
 
