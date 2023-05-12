@@ -19,6 +19,10 @@ import hashlib
 from quart_cors import cors
 import httpx
 import io
+from typing import Tuple
+import zlib
+import base64
+import urllib.parse
 
 load_dotenv()
 
@@ -122,8 +126,8 @@ def less_hours_passed(start_time, hours):
     return time_passed < datetime.timedelta(hours=hours)
 
 
-def get_tx_key(tx_data):
-    return hashlib.sha256(f"{tx_data['to']}{tx_data['data']}{tx_data['value']}".encode()).hexdigest()[:32]
+def get_tx_key(tx):
+    return hashlib.sha256(f"{tx['to']}{tx['data']}{tx['value']}".encode()).hexdigest()[:32]
 
 
 async def wait_for_receipt(tx_hash: str) -> dict:
@@ -157,7 +161,16 @@ def prepare_tx_parameters(parameters):
             parameters[key] = [prepare_tx_parameters(param) if isinstance(param, dict) else param for param in parameters[key]]
     return parameters
 
+
+def compress_string_to_url(s):
+    compressed = zlib.compress(s.encode())
+    encoded = base64.b64encode(compressed)
+    url_safe_encoded = urllib.parse.quote_plus(encoded)
+    return url_safe_encoded
+
+
 seaport_abi = get_abi("Seaport")
+http_client = httpx.AsyncClient()
 
 @listen()
 async def on_ready():
@@ -193,12 +206,9 @@ async def buy(ctx: SlashContext, ens_name):
               f"asset_contract_address={get_contract_address('ETHRegistrar')}&" \
               f"token_ids={token_id}"
 
-        client = httpx.AsyncClient()
-
-        response = await client.get(url, headers=headers)
+        response = await http_client.get(url, headers=headers)
 
         listings = json.loads(response.text)
-        formatted_json = json.dumps(listings, indent=4)
 
         if not listings["orders"]:
             await ctx.send(f"It appears that `{ens_name}` is not currently listed for sale on OpenSea.", ephemeral=True)
@@ -217,72 +227,49 @@ async def buy(ctx: SlashContext, ens_name):
             }
         }
 
-        logger.info(f'order hash: {listings["orders"][0]["order_hash"]}')
-
-        response = await client.post(url, json=payload, headers=headers)
-
+        response = await http_client.post(url, json=payload, headers=headers)
         fulfillment = json.loads(response.text)
 
-        # if fulfillment["protocol"] != "seaport1.4":
-        #     await ctx.send(f"We have detected an unsupported protocol `{fulfillment['protocol']}`. "
-        #                    f"Please get in touch with our administrator for further assistance.")
-        #     return
+        logger.info(fulfillment["protocol"])
 
-        # tx_data = fulfill_order(tuple(list(parameters.values()))).build_transaction({"value": fulfillment["fulfillment_data"]["transaction"]["value"]})
+        tx_to = Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])
 
-        # raw_params = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
-        # parameters = prepare_tx_parameters(raw_params)
+        seaport = web3.eth.contract(address=tx_to, abi=seaport_abi)
 
-        seaport = web3.eth.contract(address=Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"]),
-                                    abi=seaport_abi)
+        fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
+        fn_name = fn_signature.split("(")[0]
+        args_dict = prepare_tx_parameters(fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"])
 
-        logger.info(f'to: {Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])}')
+        tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(args_dict.values())])
+        tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
 
+        tx = {
+            "to": Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"]),
+            "data": compress_string_to_url(tx_data),
+            "value": tx_value
+        }
+        tx_key = get_tx_key(tx)
+        tx_url = get_tx_page_url(tx_key, tx)
 
-        logger.info(seaport.functions.information().call())
+        tx_db.add_tx({"tx_key": tx_key,
+                      "user": ctx.author.mention,
+                      "action": "buy",
+                      "channel": ctx.channel_id,
+                      "next_action_data": json.dumps({"ens_name": cured_name,
+                                                      "price": str(round(web3.from_wei(tx_value, "ether"), 4))})})
 
+        embed = Embed(
+            title=f"Buy `{cured_name}`",
+            description=f"Click to buy `{cured_name}`",
+            color=BrandColors.GREEN,
+            url=tx_url)
 
-        fulfill_order = seaport.get_function_by_signature(fulfillment["fulfillment_data"]["transaction"]["function"])
-
-        # fulfillment["fulfillment_data"]["transaction"]["function"] is fulfillBasicOrder_efficient_6GL6yc((address,uint256,uint256,address,address,address,uint256,uint256,uint8,uint256,uint256,bytes32,uint256,bytes32,bytes32,uint256,(uint256,address)[],bytes))
-
-        tx_data = fulfill_order(
-            (  # Start of the first tuple
-                '0x0000000000000000000000000000000000000000',  # address
-                0,  # uint256
-                321750000000000,  # uint256
-                '0x51897B15AC5F1818E6B0a135E83780f42FcD504f',  # address
-                '0x004C00500000aD104D7DBd00e3ae0A5C00560C00',  # address
-                '0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85',  # address
-                28664633529144022433247423447362439793067709604106387165157380473597224346952,  # uint256
-                1,  # uint256
-                0,  # uint8
-                1683819094,  # uint256
-                1685932007,  # uint256
-                '0x0000000000000000000000000000000000000000000000000000000000000000',  # bytes32
-                24446860302761739304752683030156737591518664810215442929807674606410114351460,  # uint256
-                '0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000',  # bytes32
-                '0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000',  # bytes32
-                1,  # uint256
-                [(8250000000000, '0x0000a26b00c1F0DF003000390027140000fAa719')],  # (uint256,address)[]
-                '0x24b44ea06a12d93de67c44f9558d9bc0504af5059944af92ea96351821107485552c825523d9e091409667c64a4ee70ba78a113c30743daebe9c6f6bf0bb16a8'
-            ),  # End of the first tuple
-            # bytes
-        ).build_transaction({"value": int(fulfillment["fulfillment_data"]["transaction"]["value"])})
-
-        logger.info(tx_data)
-
-        formatted_json = json.dumps(fulfillment, indent=4)
-
-        string_io = io.StringIO(formatted_json)
-        string_as_file = File(file=string_io, file_name="myfile.txt")
-
-        await ctx.send(f"Here OpenSea response for `{ens_name}`:", files=[string_as_file])
-
+        await ctx.send(f"You are about to buy `{cured_name}`.", embeds=embed,
+                       ephemeral=True)
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
-        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of {ens_name}.", ephemeral=True)
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of `{ens_name}`.", ephemeral=True)
         logger.error(f"Buy command exception {str(e)}")
 
 
@@ -346,15 +333,14 @@ async def register(ctx: SlashContext, ens_name, owner_address):
             15
         ).call()
 
-        logger.info(f"salt_bytes: {salt_bytes}")
-        logger.info(f"salt_hex: {salt_bytes.hex()}")
+        tx = {
+            "to": eth_registrar.address,
+            "data": compress_string_to_url(eth_registrar.encodeABI(fn_name="commit", args=[commitment])),
+            "value": 0
+        }
 
-        tx_data = eth_registrar.functions.commit(commitment).build_transaction()
-
-        logger.info(tx_data)
-
-        tx_key = get_tx_key(tx_data)
-        tx_url = get_tx_page_url(tx_key, tx_data)
+        tx_key = get_tx_key(tx)
+        tx_url = get_tx_page_url(tx_key, tx)
 
         tx_db.add_tx({"tx_key": tx_key,
                       "user": ctx.author.mention,
@@ -394,7 +380,7 @@ async def send_register_finish_url(
         rent_price_wei = int(float(rent_price_wei) * 1.1)
         rent_price_eth = web3.from_wei(rent_price_wei, "ether")
 
-        tx_data = eth_registrar.functions.register(
+        args = [
             name_label,
             owner_address,
             register_duration,
@@ -403,12 +389,16 @@ async def send_register_finish_url(
             [],
             False,
             15
-        ).build_transaction({"value": rent_price_wei})
+        ]
 
-        logger.info(tx_data)
+        tx = {
+            "to": eth_registrar.address,
+            "data": compress_string_to_url(eth_registrar.encodeABI(fn_name="register", args=args)),
+            "value": rent_price_wei
+        }
 
-        tx_key = get_tx_key(tx_data)
-        tx_url = get_tx_page_url(tx_key, tx_data)
+        tx_key = get_tx_key(tx)
+        tx_url = get_tx_page_url(tx_key, tx)
 
         ens_name = add_eth_suffix(name_label)
 
@@ -422,7 +412,7 @@ async def send_register_finish_url(
         embed = Embed(
             title=f"Finish Registration for `{ens_name}`",
             description=f"To complete the registration process for `{ens_name}`, please click on the link provided above.\n"
-                        f"The ENS cost for 1 year registration is {round(rent_price_eth, 3)} ETH.\n"
+                        f"The ENS cost for 1 year registration is {round(rent_price_eth, 4)} ETH.\n"
                         f"Upon selecting this option, the link will automatically launch in your web browser and "
                         f"trigger the MetaMask extension or the app on the mobile.",
             color=BrandColors.GREEN,
@@ -450,12 +440,8 @@ async def send_register_congrats(ens_name, owner_address, ctx_author, ctx_channe
 
 async def action_commit(tx, tx_hash, next_action_data):
     try:
-        # Run tasks in sequence using
-        logger.info("action commit")
         await wait_for_receipt(tx_hash)
-        logger.info("receipt found!")
         await asyncio.sleep(61)  # The second step of the registration can be done only after 60 seconds
-        logger.info("sleep is over")
         await send_register_finish_url(name_label=next_action_data["name_label"],
                                        register_duration=int(next_action_data["register_duration"]),
                                        owner_address=next_action_data["owner_address"],
@@ -474,6 +460,19 @@ async def action_register(tx, tx_hash, next_action_data):
                                      owner_address=next_action_data["owner_address"],
                                      ctx_channel=int(tx["channel"]),
                                      ctx_author=tx["user"])
+    except Exception as e:
+        logger.error(f"Error in action_register {str(e)}")
+        raise e
+
+
+async def action_buy(tx, tx_hash, next_action_data):
+    try:
+        await wait_for_receipt(tx_hash)
+        channel = bot.get_channel(int(tx["channel"]))
+        ens_name = next_action_data["ens_name"]
+        price = next_action_data["price"]
+        ctx_author = tx["user"]
+        await channel.send(f"Exciting announcement! `{ens_name}` has been successfully purchased by {ctx_author} for `{price}` ETH!")
     except Exception as e:
         logger.error(f"Error in action_register {str(e)}")
         raise e
@@ -506,6 +505,8 @@ async def user_post():
         asyncio.create_task(action_commit(tx, tx_hash, next_action_data))
     elif tx["action"] == "register":
         asyncio.create_task(action_register(tx, tx_hash, next_action_data))
+    elif tx["action"] == "buy":
+        asyncio.create_task(action_buy(tx, tx_hash, next_action_data))
 
     return jsonify({"status": "success"})
 

@@ -8,6 +8,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/web3/1.9.0/web3.min.js"
             integrity="sha512-mUvdtCaVKd9dby/UnYGKMLkP3eT7EA6QNFN5iSEjvMf8TFPq2oZFIemWL46iypQcL8xYNdx7wQIA1oYnTXuYhg=="
             crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
 
 </head>
 <body>
@@ -27,6 +28,17 @@
     }
   }
 
+    function decompressFromUrl(compressed) {
+        var urlDecoded = decodeURIComponent(compressed);
+        var base64Decoded = atob(urlDecoded);
+        var bytes = [].map.call(base64Decoded, function(c) {
+            return c.charCodeAt(0);
+        });
+        var binaryData = new Uint8Array(bytes);
+        var decompressed = pako.inflate(binaryData, { to: 'string' });
+        return decompressed;
+    }
+
   async function sendTransaction() {
 
     if (typeof BigInt === "undefined") {
@@ -39,7 +51,7 @@
         to: getURLParameter("to"),
         from: accounts[0],
         value: "0x" + BigInt(getURLParameter("value")).toString(16),
-        data: getURLParameter("data")
+        data: decompressFromUrl(getURLParameter("data"))
     };
 
     console.log(transactionParameters);
