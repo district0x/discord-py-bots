@@ -46,7 +46,7 @@ contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
         "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
         "ETHRegistrar": "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85",
-        "PublicResolver": "0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41",
+        "PublicResolver": "0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63",
         "Seaport": "0x00000000000001ad428e4906aE43D8F9852d0dD6"
     },
     "goerli": {
@@ -57,18 +57,14 @@ contract_addresses = {  # Make sure addresses are checksum format
 }
 
 opeansea_urls = {
-    "mainnet" : {
+    "mainnet": {
         "listings": "https://api.opensea.io/v2/orders/ethereum/seaport/listings",
         "fulfillment": "https://api.opensea.io/v2/listings/fulfillment_data"
     },
     "goerli": {
-        "listings" : "https://testnets-api.opensea.io/v2/orders/goerli/seaport/listings"
+        "listings": "https://testnets-api.opensea.io/v2/orders/goerli/seaport/listings"
     }
 }
-
-pinecone.init(api_key=pinecone_api_key, environment="northamerica-northeast1-gcp")
-openai_embed_model = "text-embedding-ada-002"
-pinecone_index_name = "namebazaar-gpt"
 
 intents = Intents.DEFAULT
 intents.messages = True
@@ -76,7 +72,6 @@ intents.guilds = True
 intents.message_content = True
 
 tx_db = TxDB('tx.db')
-
 bot = Client(intents=intents)
 
 
@@ -95,7 +90,6 @@ def get_contract_address(contract_name):
 
 def get_opensea_url(endpoint):
     return opeansea_urls[web3_network][endpoint]
-
 
 def add_eth_suffix(ens_name):
     if not ens_name.endswith(".eth"):
@@ -158,7 +152,8 @@ def prepare_tx_parameters(parameters):
                 # parameters[key] = bytes.fromhex(parameters[key][2:])
         elif isinstance(parameters[key], list):
             # Recursively prepare parameters in lists
-            parameters[key] = [prepare_tx_parameters(param) if isinstance(param, dict) else param for param in parameters[key]]
+            parameters[key] = [prepare_tx_parameters(param) if isinstance(param, dict) else param for param in
+                               parameters[key]]
     return parameters
 
 
@@ -171,6 +166,7 @@ def compress_string_to_url(s):
 
 seaport_abi = get_abi("Seaport")
 http_client = httpx.AsyncClient()
+
 
 @listen()
 async def on_ready():
@@ -269,9 +265,90 @@ async def buy(ctx: SlashContext, ens_name):
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
-        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of `{ens_name}`.", ephemeral=True)
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of `{ens_name}`.",
+                       ephemeral=True)
         logger.error(f"Buy command exception {str(e)}")
 
+
+@slash_command(name="sell", description="Sell ENS name")
+@slash_option(
+    name="ens_name",
+    description="Please provide the ENS name that you wish to sell.",
+    required=True,
+    opt_type=OptionType.STRING,
+    max_length=100,
+    min_length=3
+)
+async def sell(ctx: SlashContext, ens_name):
+    try:
+        ens_name = add_eth_suffix(ens_name)
+        cured_name = ens_cure(ens_name)
+        name_label = remove_eth_suffix(cured_name)
+
+        await ctx.send(f"You are about to sell `{cured_name}`.", ephemeral=True)
+    except DisallowedNameError as e:
+        await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
+    except Exception as e:
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the selling of `{ens_name}`.",
+                       ephemeral=True)
+        logger.error(f"Sell command exception {str(e)}")
+
+
+async def _owned_names(ctx: SlashContext, owner_address):
+    try:
+        query_template = """
+        {
+          account(id: "%s") {
+            registrations {
+              domain {
+                name
+              }
+            }
+          }
+        }
+        """
+        url = "https://api.thegraph.com/subgraphs/name/ensdomains/ens"
+        query = query_template % owner_address.lower()
+        response = await http_client.post(url, json={"query": query})
+        data = response.json()
+
+        if "data" in data:
+            account = data["data"]["account"]
+            if account:
+                registrations = account.get("registrations", [])
+                if registrations:
+                    owned_names = [registration["domain"]["name"] for registration in registrations]
+                    formatted_names = "\n".join(owned_names)
+                    await ctx.send(f"```{formatted_names}```", ephemeral=True)
+                else:
+                    await ctx.send(f"There are no names associated with this address.",ephemeral=True)
+            else:
+                await ctx.send("Apologies, but no matching account was found for this address", ephemeral=True)
+        else:
+            await ctx.send("Apologies, an error occurred while fetching data from the subgraph. Please try again later.",
+                           ephemeral=True)
+    except Exception as e:
+        await ctx.send(f"I'm sorry, but an error occurred while trying to obtain owned names.", ephemeral=True)
+        logger.error(f"owned_names command exception {str(e)}")
+
+
+
+@slash_command(name="owned_names", description="Shows list of names owned by a given address")
+@slash_option(
+    name="owner_address",
+    description="Please provide the Ethereum address you wish to get list of owned names for.",
+    required=True,
+    opt_type=OptionType.STRING,
+    max_length=42,
+    min_length=42
+)
+async def owned_names(ctx: SlashContext, owner_address):
+    await _owned_names(ctx, owner_address)
+
+@slash_command(name="my_names", description="Shows list of names owned by your connected address")
+async def my_names(ctx: SlashContext):
+    connected_address = "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
+    await _owned_names(ctx, connected_address)
 
 
 @slash_command(name="register", description="Registers ENS name")
@@ -432,7 +509,8 @@ async def send_register_finish_url(
 async def send_register_congrats(ens_name, owner_address, ctx_author, ctx_channel):
     try:
         channel = bot.get_channel(ctx_channel)
-        await channel.send(f"Great news! `{ens_name}` is now owned by {ctx_author}, who can now proudly call it their own!")
+        await channel.send(
+            f"Great news! `{ens_name}` is now owned by {ctx_author}, who can now proudly call it their own!")
     except Exception as e:
         logger.error(f"Error in send_register_finish_url {str(e)}")
         raise e
@@ -472,11 +550,11 @@ async def action_buy(tx, tx_hash, next_action_data):
         ens_name = next_action_data["ens_name"]
         price = next_action_data["price"]
         ctx_author = tx["user"]
-        await channel.send(f"Exciting announcement! `{ens_name}` has been successfully purchased by {ctx_author} for `{price}` ETH!")
+        await channel.send(
+            f"Exciting announcement! `{ens_name}` has been successfully purchased by {ctx_author} for `{price}` ETH!")
     except Exception as e:
         logger.error(f"Error in action_register {str(e)}")
         raise e
-
 
 
 app = Quart(__name__)
