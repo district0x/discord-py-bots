@@ -46,8 +46,11 @@ contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
         "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
         "ETHRegistrar": "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85",
+        "ENSRegistry": "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e",
         "PublicResolver": "0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63",
-        "Seaport": "0x00000000000001ad428e4906aE43D8F9852d0dD6"
+        "NameWrapper": "0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401",
+        "Seaport": "0x00000000000001ad428e4906aE43D8F9852d0dD6",
+        "OpenSeaConduit": "0x1E0049783F008A0085193E00003D00cd54003c71"
     },
     "goerli": {
         "ETHRegistrarController": "0xCc5e7dB10E65EED1BBD105359e7268aa660f6734",
@@ -65,6 +68,8 @@ opeansea_urls = {
         "listings": "https://testnets-api.opensea.io/v2/orders/goerli/seaport/listings"
     }
 }
+
+subgraph_url = "https://api.thegraph.com/subgraphs/name/ensdomains/ens"
 
 intents = Intents.DEFAULT
 intents.messages = True
@@ -105,6 +110,15 @@ def remove_eth_suffix(s: str) -> str:
         return s
 
 
+def is_top_level_eth(ens_name):
+    parts = ens_name.split(".")
+
+    if len(parts) == 2 and parts[1] == "eth":
+        return True
+
+    return False
+
+
 def get_tx_page_url(tx_key, tx_data):
     return f"{tx_page_url}?tx_key={tx_key}&to={tx_data['to']}&data={tx_data['data']}&value={tx_data['value']}" \
            f"&host={server_host}&port={server_port}"
@@ -113,8 +127,10 @@ def get_tx_page_url(tx_key, tx_data):
 web3 = Web3(Web3.WebsocketProvider(infura_url))
 eth_registrar = web3.eth.contract(address=get_contract_address("ETHRegistrarController"),
                                   abi=get_abi("ETHRegistrarController"))
-public_resolver = web3.eth.contract(address=get_contract_address("PublicResolver"),
-                                    abi=get_abi("PublicResolver"))
+public_resolver = web3.eth.contract(address=get_contract_address("PublicResolver"), abi=get_abi("PublicResolver"))
+name_wrapper = web3.eth.contract(address=get_contract_address("NameWrapper"), abi=get_abi("NameWrapper"))
+ens_registry = web3.eth.contract(address=get_contract_address("ENSRegistry"), abi=get_abi("ENSRegistry"))
+opensea_conduit = web3.eth.contract(address=get_contract_address("OpenSeaConduit"), abi=get_abi("OpenSeaConduit"))
 
 
 def less_hours_passed(start_time, hours):
@@ -196,6 +212,12 @@ async def on_ready():
 )
 async def buy(ctx: SlashContext, ens_name):
     try:
+
+        if not is_top_level_eth(ens_name):
+            await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
+                           ephemeral=True)
+            return
+
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
@@ -292,9 +314,56 @@ async def buy(ctx: SlashContext, ens_name):
 )
 async def sell(ctx: SlashContext, ens_name):
     try:
+        connected_address = "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
+
+        if not is_top_level_eth(ens_name):
+            await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
+                           ephemeral=True)
+            return
+
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
+        node = namehash(cured_name)
+        hex_node = node.hex()
+        label_hash = Web3.keccak(text=name_label)
+        token_id = int.from_bytes(label_hash, byteorder='big')
+        hex_label = hex(token_id)
+
+        query = f"""
+                {{
+                  registration(
+                    id: "{hex_label}"
+                  ) {{
+                    registrant {{
+                      id
+                    }}
+                  }}
+                  wrappedDomain(
+                    id: "{hex_node}"
+                  ) {{
+                    owner {{
+                      id
+                    }}
+                  }}
+                }}
+                """
+        logger.info(query)
+        response = await http_client.post(subgraph_url, json={"query": query})
+        data = response.json().get('data', {})
+        registration = data.get('registration')
+        wrapped_domain = data.get('wrappedDomain')
+
+        owner = None
+        if registration is not None:
+            owner = registration.get('registrant', {}).get('id')
+
+        if wrapped_domain is not None:
+            owner = wrapped_domain.get('owner', {}).get('id')
+
+        if owner is None or owner.lower() != connected_address.lower():
+            await ctx.send(f"It appears that you don't own `{cured_name}`.", ephemeral=True)
+            return
 
         await ctx.send(f"You are about to sell `{cured_name}`.", ephemeral=True)
     except DisallowedNameError as e:
@@ -323,9 +392,8 @@ async def _owned_names(ctx: SlashContext, owner_address):
           }
         }
         """
-        url = "https://api.thegraph.com/subgraphs/name/ensdomains/ens"
         query = query_template % owner_address.lower()
-        response = await http_client.post(url, json={"query": query})
+        response = await http_client.post(subgraph_url, json={"query": query})
         data = response.json()
 
         if "data" in data:
