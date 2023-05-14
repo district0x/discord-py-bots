@@ -91,6 +91,7 @@ def get_contract_address(contract_name):
 def get_opensea_url(endpoint):
     return opeansea_urls[web3_network][endpoint]
 
+
 def add_eth_suffix(ens_name):
     if not ens_name.endswith(".eth"):
         ens_name += ".eth"
@@ -112,6 +113,8 @@ def get_tx_page_url(tx_key, tx_data):
 web3 = Web3(Web3.WebsocketProvider(infura_url))
 eth_registrar = web3.eth.contract(address=get_contract_address("ETHRegistrarController"),
                                   abi=get_abi("ETHRegistrarController"))
+public_resolver = web3.eth.contract(address=get_contract_address("PublicResolver"),
+                                    abi=get_abi("PublicResolver"))
 
 
 def less_hours_passed(start_time, hours):
@@ -122,6 +125,14 @@ def less_hours_passed(start_time, hours):
 
 def get_tx_key(tx):
     return hashlib.sha256(f"{tx['to']}{tx['data']}{tx['value']}".encode()).hexdigest()[:32]
+
+
+def namehash(name):
+    if name == '':
+        return b'\0' * 32
+    else:
+        label, _, remainder = name.partition('.')
+        return Web3.keccak(namehash(remainder) + Web3.keccak(text=label))
 
 
 async def wait_for_receipt(tx_hash: str) -> dict:
@@ -304,6 +315,11 @@ async def _owned_names(ctx: SlashContext, owner_address):
                 name
               }
             }
+            wrappedDomains {
+              domain {
+                name
+              }
+            }
           }
         }
         """
@@ -316,21 +332,30 @@ async def _owned_names(ctx: SlashContext, owner_address):
             account = data["data"]["account"]
             if account:
                 registrations = account.get("registrations", [])
-                if registrations:
-                    owned_names = [registration["domain"]["name"] for registration in registrations]
-                    formatted_names = "\n".join(owned_names)
-                    await ctx.send(f"```{formatted_names}```", ephemeral=True)
-                else:
-                    await ctx.send(f"There are no names associated with this address.",ephemeral=True)
+                wrapped_domains = account.get("wrappedDomains", [])
+                if not registrations and not wrapped_domains:
+                    await ctx.send(f"There are no names associated with this address.", ephemeral=True)
+                    return
+
+                wrapped_domain_names = [item["domain"]["name"] for item in wrapped_domains]
+                registration_names = [item["domain"]["name"] for item in registrations]
+
+                combined_names = wrapped_domain_names + registration_names
+                unique_sorted_names = sorted(list(set(combined_names)))
+
+                formatted_names = "\n".join(unique_sorted_names)
+                logger.info(formatted_names)
+                await ctx.send(f"```\n{formatted_names}```", ephemeral=True)
+
             else:
                 await ctx.send("Apologies, but no matching account was found for this address", ephemeral=True)
         else:
-            await ctx.send("Apologies, an error occurred while fetching data from the subgraph. Please try again later.",
-                           ephemeral=True)
+            await ctx.send(
+                "Apologies, an error occurred while fetching data from the subgraph. Please try again later.",
+                ephemeral=True)
     except Exception as e:
         await ctx.send(f"I'm sorry, but an error occurred while trying to obtain owned names.", ephemeral=True)
         logger.error(f"owned_names command exception {str(e)}")
-
 
 
 @slash_command(name="owned_names", description="Shows list of names owned by a given address")
@@ -344,6 +369,7 @@ async def _owned_names(ctx: SlashContext, owner_address):
 )
 async def owned_names(ctx: SlashContext, owner_address):
     await _owned_names(ctx, owner_address)
+
 
 @slash_command(name="my_names", description="Shows list of names owned by your connected address")
 async def my_names(ctx: SlashContext):
@@ -360,17 +386,10 @@ async def my_names(ctx: SlashContext):
     max_length=100,
     min_length=3
 )
-@slash_option(
-    name="owner_address",
-    description="Please provide the Ethereum address you wish to register an ENS name with.",
-    required=True,
-    opt_type=OptionType.STRING,
-    max_length=42,
-    min_length=42
-)
-async def register(ctx: SlashContext, ens_name, owner_address):
+async def register(ctx: SlashContext, ens_name):
     register_duration = 31536000
     logger.info(f"register {ens_name}")
+    owner_address = "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
 
     try:
         ens_name = add_eth_suffix(ens_name)
@@ -390,12 +409,13 @@ async def register(ctx: SlashContext, ens_name, owner_address):
 
         is_available = eth_registrar.functions.available(name_label).call()
 
-        logger.info(f"available: {is_available}")
-
         if not is_available:
             await ctx.send(f"I apologize, but the name `{cured_name}` is not available for registration.",
                            ephemeral=True)
             return
+
+        node = namehash(ens_name)
+        set_addr_data = public_resolver.encodeABI(fn_name="setAddr", args=[node, owner_address])[2:]
 
         salt_bytes = os.urandom(32)
 
@@ -404,10 +424,10 @@ async def register(ctx: SlashContext, ens_name, owner_address):
             owner_address,
             register_duration,
             salt_bytes,
-            get_contract_address("PublicResolver"),
-            [],
+            public_resolver.address,
+            [bytes.fromhex(set_addr_data)],
             False,
-            15
+            0
         ).call()
 
         tx = {
@@ -426,7 +446,8 @@ async def register(ctx: SlashContext, ens_name, owner_address):
                       "next_action_data": json.dumps({"name_label": name_label,
                                                       "owner_address": owner_address,
                                                       "register_duration": register_duration,
-                                                      "salt_hex": salt_bytes.hex()})})
+                                                      "salt_hex": salt_bytes.hex(),
+                                                      "set_addr_data": set_addr_data})})
 
         embed = Embed(
             title=f"Begin Registration for `{cured_name}`",
@@ -450,7 +471,7 @@ async def register(ctx: SlashContext, ens_name, owner_address):
 
 
 async def send_register_finish_url(
-        name_label, register_duration, owner_address, salt_bytes, ctx_author, ctx_channel):
+        name_label, register_duration, owner_address, salt_bytes, set_addr_data, ctx_author, ctx_channel):
     try:
         # Add 10% to account for price fluctuation; the difference is refunded.
         rent_price_wei = eth_registrar.functions.rentPrice(name_label, register_duration).call()[0]
@@ -462,10 +483,10 @@ async def send_register_finish_url(
             owner_address,
             register_duration,
             salt_bytes,
-            get_contract_address("PublicResolver"),
-            [],
+            public_resolver.address,
+            [bytes.fromhex(set_addr_data)],
             False,
-            15
+            0
         ]
 
         tx = {
@@ -516,7 +537,7 @@ async def send_register_congrats(ens_name, owner_address, ctx_author, ctx_channe
         raise e
 
 
-async def action_commit(tx, tx_hash, next_action_data):
+async def commit_callback(tx, tx_hash, next_action_data):
     try:
         await wait_for_receipt(tx_hash)
         await asyncio.sleep(61)  # The second step of the registration can be done only after 60 seconds
@@ -524,6 +545,7 @@ async def action_commit(tx, tx_hash, next_action_data):
                                        register_duration=int(next_action_data["register_duration"]),
                                        owner_address=next_action_data["owner_address"],
                                        salt_bytes=bytes.fromhex(next_action_data["salt_hex"]),
+                                       set_addr_data=next_action_data["set_addr_data"],
                                        ctx_channel=int(tx["channel"]),
                                        ctx_author=tx["user"])
     except Exception as e:
@@ -531,7 +553,7 @@ async def action_commit(tx, tx_hash, next_action_data):
         raise e
 
 
-async def action_register(tx, tx_hash, next_action_data):
+async def register_callback(tx, tx_hash, next_action_data):
     try:
         await wait_for_receipt(tx_hash)
         await send_register_congrats(ens_name=next_action_data["ens_name"],
@@ -543,7 +565,7 @@ async def action_register(tx, tx_hash, next_action_data):
         raise e
 
 
-async def action_buy(tx, tx_hash, next_action_data):
+async def buy_callback(tx, tx_hash, next_action_data):
     try:
         await wait_for_receipt(tx_hash)
         channel = bot.get_channel(int(tx["channel"]))
@@ -580,11 +602,11 @@ async def user_post():
     next_action_data = json.loads(tx["next_action_data"])
 
     if tx["action"] == "commit":
-        asyncio.create_task(action_commit(tx, tx_hash, next_action_data))
+        asyncio.create_task(commit_callback(tx, tx_hash, next_action_data))
     elif tx["action"] == "register":
-        asyncio.create_task(action_register(tx, tx_hash, next_action_data))
+        asyncio.create_task(register_callback(tx, tx_hash, next_action_data))
     elif tx["action"] == "buy":
-        asyncio.create_task(action_buy(tx, tx_hash, next_action_data))
+        asyncio.create_task(buy_callback(tx, tx_hash, next_action_data))
 
     return jsonify({"status": "success"})
 
