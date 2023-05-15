@@ -23,6 +23,7 @@ from typing import Tuple
 import zlib
 import base64
 import urllib.parse
+import random
 
 load_dotenv()
 
@@ -119,8 +120,11 @@ def is_top_level_eth(ens_name):
     return False
 
 
-def get_tx_page_url(tx_key, tx_data):
-    return f"{tx_page_url}?tx_key={tx_key}&to={tx_data['to']}&data={tx_data['data']}&value={tx_data['value']}" \
+def get_tx_page_url(tx_key, tx_data, sign=False):
+    return f"{tx_page_url}?tx_key={tx_key}&to={tx_data['to']}&" \
+           f"data={tx_data['data']}&" \
+           f"value={tx_data['value']}&" \
+           f"sign={sign}&" \
            f"&host={server_host}&port={server_port}"
 
 
@@ -131,7 +135,8 @@ public_resolver = web3.eth.contract(address=get_contract_address("PublicResolver
 name_wrapper = web3.eth.contract(address=get_contract_address("NameWrapper"), abi=get_abi("NameWrapper"))
 ens_registry = web3.eth.contract(address=get_contract_address("ENSRegistry"), abi=get_abi("ENSRegistry"))
 opensea_conduit = web3.eth.contract(address=get_contract_address("OpenSeaConduit"), abi=get_abi("OpenSeaConduit"))
-
+seaport_abi = get_abi("Seaport")
+seaport = web3.eth.contract(address=get_contract_address("Seaport"), abi=seaport_abi)
 
 def less_hours_passed(start_time, hours):
     now = datetime.datetime.now()
@@ -149,6 +154,13 @@ def namehash(name):
     else:
         label, _, remainder = name.partition('.')
         return Web3.keccak(namehash(remainder) + Web3.keccak(text=label))
+
+
+def generate_opensea_salt():
+    salt_length = 32
+    salt_min_value = 10 ** (salt_length - 1)
+    salt_max_value = (10 ** salt_length) - 1
+    return random.randint(salt_min_value, salt_max_value)
 
 
 async def wait_for_receipt(tx_hash: str) -> dict:
@@ -190,8 +202,6 @@ def compress_string_to_url(s):
     url_safe_encoded = urllib.parse.quote_plus(encoded)
     return url_safe_encoded
 
-
-seaport_abi = get_abi("Seaport")
 http_client = httpx.AsyncClient()
 
 
@@ -275,6 +285,7 @@ async def buy(ctx: SlashContext, ens_name):
         tx = {
             "to": Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"]),
             "data": compress_string_to_url(tx_data),
+            "data": compress_string_to_url(tx_data),
             "value": tx_value
         }
         tx_key = get_tx_key(tx)
@@ -312,9 +323,32 @@ async def buy(ctx: SlashContext, ens_name):
     max_length=100,
     min_length=3
 )
-async def sell(ctx: SlashContext, ens_name):
+@slash_option(
+    name="start_price",
+    description="Specify the initial selling price for your name in ETH.",
+    required=True,
+    opt_type=OptionType.NUMBER,
+)
+@slash_option(
+    name="end_price",
+    description="Specify the final selling price for your name in ETH.",
+    required=False,
+    opt_type=OptionType.NUMBER,
+)
+@slash_option(
+    name="duration_days",
+    description="Specify the duration, in days, for which your listing will remain valid. (default 100 days)",
+    required=False,
+    opt_type=OptionType.INTEGER,
+    min_value=1,
+    max_value=1000
+)
+async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duration_days=100):
     try:
         connected_address = "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
+
+        if end_price is None:
+            end_price = start_price
 
         if not is_top_level_eth(ens_name):
             await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
@@ -355,23 +389,86 @@ async def sell(ctx: SlashContext, ens_name):
         wrapped_domain = data.get('wrappedDomain')
 
         owner = None
+        is_wrapped = False
         if registration is not None:
             owner = registration.get('registrant', {}).get('id')
 
         if wrapped_domain is not None:
             owner = wrapped_domain.get('owner', {}).get('id')
+            is_wrapped = True
 
         if owner is None or owner.lower() != connected_address.lower():
             await ctx.send(f"It appears that you don't own `{cured_name}`.", ephemeral=True)
             return
 
-        await ctx.send(f"You are about to sell `{cured_name}`.", ephemeral=True)
+        end_time = int((datetime.datetime.now() + datetime.timedelta(days=duration_days)).timestamp() * 1000)
+        start_price = Web3.to_wei(start_price, "ether")
+        end_price = Web3.to_wei(end_price, "ether")
+
+        order_params = {
+            "offerer": connected_address,
+            "zone": "0x004C00500000aD104D7DBd00e3ae0A5C00560C00",
+            "zoneHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "startTime": "0",
+            "endTime": end_time,
+            "orderType": 0,
+            "offer": [{
+                "itemType": 3 if is_wrapped else 2,
+                "token": name_wrapper.address if is_wrapped else eth_registrar.address,
+                "identifierOrCriteria": token_id,
+                "startAmount": start_price,
+                "endAmount": end_price
+            }],
+            "consideration": [{
+                "itemType": 0,
+                "token": "0x0000000000000000000000000000000000000000",
+                "identifierOrCriteria": 0,
+                "startAmount": start_price,
+                "endAmount": end_price,
+                "recipient": connected_address,
+            }],
+            "totalOriginalConsiderationItems": 1,
+            "salt": generate_opensea_salt(),
+            "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
+            "counter": 0,
+        }
+
+        order_params_json = json.dumps(order_params)
+
+        tx = {
+            "to": seaport.address,
+            "data": compress_string_to_url(order_params_json),
+            "value": 0
+        }
+
+        tx_key = get_tx_key(tx)
+        tx_url = get_tx_page_url(tx_key, tx, sign=True)
+
+        tx_db.add_tx({"tx_key": tx_key,
+                      "user": ctx.author.mention,
+                      "action": "commit",
+                      "channel": ctx.channel_id,
+                      "next_action_data": order_params_json})
+
+        embed = Embed(
+            title=f"Sign the sales contract for `{cured_name}`",
+            description=f"To initiate the selling process for `{cured_name}`, please click on the link above.\n"
+                        f"Upon clicking this, the URL will open in your browser, which will then automatically launch"
+                        f" your MetaMask browser extension or the app on the mobile. Please make sure you have "
+                        f"the MetaMask installed.\n"
+                        f"You will be notified once we are ready to proceed with the second step of the registration process.",
+            color=BrandColors.GREEN,
+            url=tx_url)
+
+        await ctx.send(f"", embeds=embed,
+                       ephemeral=True)
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
         await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the selling of `{ens_name}`.",
                        ephemeral=True)
         logger.error(f"Sell command exception {str(e)}")
+        raise e
 
 
 async def _owned_names(ctx: SlashContext, owner_address):
@@ -412,7 +509,6 @@ async def _owned_names(ctx: SlashContext, owner_address):
                 unique_sorted_names = sorted(list(set(combined_names)))
 
                 formatted_names = "\n".join(unique_sorted_names)
-                logger.info(formatted_names)
                 await ctx.send(f"```\n{formatted_names}```", ephemeral=True)
 
             else:
@@ -424,6 +520,7 @@ async def _owned_names(ctx: SlashContext, owner_address):
     except Exception as e:
         await ctx.send(f"I'm sorry, but an error occurred while trying to obtain owned names.", ephemeral=True)
         logger.error(f"owned_names command exception {str(e)}")
+        raise e
 
 
 @slash_command(name="owned_names", description="Shows list of names owned by a given address")
@@ -536,6 +633,7 @@ async def register(ctx: SlashContext, ens_name):
         # Handle the exception here
         logger.info(f"REGISTER EXCEPTION {str(e)}")
         await ctx.respond('An error occurred: {}'.format(str(e)))
+        raise e
 
 
 async def send_register_finish_url(
