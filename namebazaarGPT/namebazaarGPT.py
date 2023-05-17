@@ -19,7 +19,6 @@ import hashlib
 from quart_cors import cors
 import httpx
 import io
-from typing import Tuple
 import zlib
 import base64
 import urllib.parse
@@ -46,11 +45,11 @@ server_port = os.getenv('SERVER_PORT')
 contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
         "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
-        "ETHRegistrar": "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85",
+        "ETHRegistrar": "0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85",
         "ENSRegistry": "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e",
         "PublicResolver": "0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63",
         "NameWrapper": "0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401",
-        "Seaport": "0x00000000000001ad428e4906aE43D8F9852d0dD6",
+        "Seaport": "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC",
         "OpenSeaConduit": "0x1E0049783F008A0085193E00003D00cd54003c71"
     },
     "goerli": {
@@ -72,13 +71,18 @@ opeansea_urls = {
 
 subgraph_url = "https://api.thegraph.com/subgraphs/name/ensdomains/ens"
 
-intents = Intents.DEFAULT
+intents = Intents.MESSAGES
 intents.messages = True
 intents.guilds = True
 intents.message_content = True
+intents.members = True
 
 tx_db = TxDB('tx.db')
 bot = Client(intents=intents)
+
+
+def mention(user_id):
+    return f"<@{user_id}>"
 
 
 def hexlify(name):
@@ -120,23 +124,30 @@ def is_top_level_eth(ens_name):
     return False
 
 
-def get_tx_page_url(tx_key, tx_data, sign=False):
-    return f"{tx_page_url}?tx_key={tx_key}&to={tx_data['to']}&" \
-           f"data={tx_data['data']}&" \
-           f"value={tx_data['value']}&" \
-           f"sign={sign}&" \
-           f"&host={server_host}&port={server_port}"
+def get_tx_page_url(tx_key, tx_data, sign_spec=None):
+    base_url = f"{tx_page_url}?" \
+               f"tx_key={tx_key}&" \
+               f"to={tx_data['to']}&" \
+               f"data={tx_data['data']}&" \
+               f"value={tx_data['value']}&" \
+               f"host={server_host}&" \
+               f"port={server_port}"
+    if sign_spec:
+        base_url += f"&sign_spec={sign_spec}"
+    return base_url
 
 
 web3 = Web3(Web3.WebsocketProvider(infura_url))
-eth_registrar = web3.eth.contract(address=get_contract_address("ETHRegistrarController"),
-                                  abi=get_abi("ETHRegistrarController"))
+eth_registrar_controller = web3.eth.contract(address=get_contract_address("ETHRegistrarController"),
+                                             abi=get_abi("ETHRegistrarController"))
+eth_registrar = web3.eth.contract(address=get_contract_address("ETHRegistrar"), abi=get_abi("ETHRegistrar"))
 public_resolver = web3.eth.contract(address=get_contract_address("PublicResolver"), abi=get_abi("PublicResolver"))
 name_wrapper = web3.eth.contract(address=get_contract_address("NameWrapper"), abi=get_abi("NameWrapper"))
 ens_registry = web3.eth.contract(address=get_contract_address("ENSRegistry"), abi=get_abi("ENSRegistry"))
 opensea_conduit = web3.eth.contract(address=get_contract_address("OpenSeaConduit"), abi=get_abi("OpenSeaConduit"))
 seaport_abi = get_abi("Seaport")
 seaport = web3.eth.contract(address=get_contract_address("Seaport"), abi=seaport_abi)
+
 
 def less_hours_passed(start_time, hours):
     now = datetime.datetime.now()
@@ -157,7 +168,7 @@ def namehash(name):
 
 
 def generate_opensea_salt():
-    salt_length = 32
+    salt_length = 77
     salt_min_value = 10 ** (salt_length - 1)
     salt_max_value = (10 ** salt_length) - 1
     return random.randint(salt_min_value, salt_max_value)
@@ -201,6 +212,15 @@ def compress_string_to_url(s):
     encoded = base64.b64encode(compressed)
     url_safe_encoded = urllib.parse.quote_plus(encoded)
     return url_safe_encoded
+
+
+def split_opensea_consideration(wei_value):
+    # Split the provided wei_value into two parts: 97.5% and 2.5%
+    part1 = int(wei_value * 0.975)
+    part2 = int(wei_value * 0.025)
+
+    return part1, part2
+
 
 http_client = httpx.AsyncClient()
 
@@ -285,14 +305,13 @@ async def buy(ctx: SlashContext, ens_name):
         tx = {
             "to": Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"]),
             "data": compress_string_to_url(tx_data),
-            "data": compress_string_to_url(tx_data),
             "value": tx_value
         }
         tx_key = get_tx_key(tx)
         tx_url = get_tx_page_url(tx_key, tx)
 
         tx_db.add_tx({"tx_key": tx_key,
-                      "user": ctx.author.mention,
+                      "user": ctx.author_id,
                       "action": "buy",
                       "channel": ctx.channel_id,
                       "next_action_data": json.dumps({"ens_name": cured_name,
@@ -350,13 +369,14 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
         if end_price is None:
             end_price = start_price
 
-        if not is_top_level_eth(ens_name):
+        ens_name = add_eth_suffix(ens_name)
+        cured_name = ens_cure(ens_name)
+
+        if not is_top_level_eth(cured_name):
             await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
                            ephemeral=True)
             return
 
-        ens_name = add_eth_suffix(ens_name)
-        cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
         node = namehash(cured_name)
         hex_node = node.hex()
@@ -382,7 +402,6 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
                   }}
                 }}
                 """
-        logger.info(query)
         response = await http_client.post(subgraph_url, json={"query": query})
         data = response.json().get('data', {})
         registration = data.get('registration')
@@ -395,40 +414,52 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
 
         if wrapped_domain is not None:
             owner = wrapped_domain.get('owner', {}).get('id')
+            token_id = int.from_bytes(node, byteorder='big')
             is_wrapped = True
 
         if owner is None or owner.lower() != connected_address.lower():
             await ctx.send(f"It appears that you don't own `{cured_name}`.", ephemeral=True)
             return
 
-        end_time = int((datetime.datetime.now() + datetime.timedelta(days=duration_days)).timestamp() * 1000)
-        start_price = Web3.to_wei(start_price, "ether")
-        end_price = Web3.to_wei(end_price, "ether")
+        start_time = int(datetime.datetime.now().timestamp())
+        end_time = int((datetime.datetime.now() + datetime.timedelta(days=duration_days)).timestamp())
+
+        start_price_wei = Web3.to_wei(start_price, "ether")
+        end_price_wei = Web3.to_wei(end_price, "ether")
+        owner_start_price, fees_start_price = split_opensea_consideration(start_price_wei)
+        owner_end_price, fees_end_price = split_opensea_consideration(end_price_wei)
 
         order_params = {
             "offerer": connected_address,
-            "zone": "0x004C00500000aD104D7DBd00e3ae0A5C00560C00",
-            "zoneHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "startTime": "0",
-            "endTime": end_time,
-            "orderType": 0,
             "offer": [{
                 "itemType": 3 if is_wrapped else 2,
                 "token": name_wrapper.address if is_wrapped else eth_registrar.address,
-                "identifierOrCriteria": token_id,
-                "startAmount": start_price,
-                "endAmount": end_price
+                "identifierOrCriteria": str(token_id),
+                "startAmount": 1,
+                "endAmount": 1
             }],
             "consideration": [{
                 "itemType": 0,
                 "token": "0x0000000000000000000000000000000000000000",
                 "identifierOrCriteria": 0,
-                "startAmount": start_price,
-                "endAmount": end_price,
+                "startAmount": str(owner_start_price),
+                "endAmount": str(owner_end_price),
                 "recipient": connected_address,
+            }, {  ## OpenSea Fees have to be defined, at least 2.5%
+                "itemType": 0,
+                "token": "0x0000000000000000000000000000000000000000",
+                "identifierOrCriteria": 0,
+                "startAmount": str(fees_start_price),
+                "endAmount": str(fees_end_price),
+                "recipient": "0x0000a26b00c1F0DF003000390027140000fAa719",
             }],
-            "totalOriginalConsiderationItems": 1,
-            "salt": generate_opensea_salt(),
+            "totalOriginalConsiderationItems": 2,
+            "startTime": start_time,
+            "endTime": end_time,
+            "orderType": 1,
+            "zone": "0x004C00500000aD104D7DBd00e3ae0A5C00560C00",
+            "zoneHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "salt": str(generate_opensea_salt()),
             "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
             "counter": 0,
         }
@@ -442,11 +473,11 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
         }
 
         tx_key = get_tx_key(tx)
-        tx_url = get_tx_page_url(tx_key, tx, sign=True)
+        tx_url = get_tx_page_url(tx_key, tx, sign_spec="OSCreateListing")
 
         tx_db.add_tx({"tx_key": tx_key,
-                      "user": ctx.author.mention,
-                      "action": "commit",
+                      "user": ctx.author_id,
+                      "action": "sell",
                       "channel": ctx.channel_id,
                       "next_action_data": order_params_json})
 
@@ -465,7 +496,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
-        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the selling of `{ens_name}`.",
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the selling of `{cured_name}`.",
                        ephemeral=True)
         logger.error(f"Sell command exception {str(e)}")
         raise e
@@ -572,7 +603,7 @@ async def register(ctx: SlashContext, ens_name):
                            f"Please feel free to share your intended use case with us!", ephemeral=True)
             return
 
-        is_available = eth_registrar.functions.available(name_label).call()
+        is_available = eth_registrar_controller.functions.available(name_label).call()
 
         if not is_available:
             await ctx.send(f"I apologize, but the name `{cured_name}` is not available for registration.",
@@ -584,7 +615,7 @@ async def register(ctx: SlashContext, ens_name):
 
         salt_bytes = os.urandom(32)
 
-        commitment = eth_registrar.functions.makeCommitment(
+        commitment = eth_registrar_controller.functions.makeCommitment(
             name_label,
             owner_address,
             register_duration,
@@ -596,8 +627,8 @@ async def register(ctx: SlashContext, ens_name):
         ).call()
 
         tx = {
-            "to": eth_registrar.address,
-            "data": compress_string_to_url(eth_registrar.encodeABI(fn_name="commit", args=[commitment])),
+            "to": eth_registrar_controller.address,
+            "data": compress_string_to_url(eth_registrar_controller.encodeABI(fn_name="commit", args=[commitment])),
             "value": 0
         }
 
@@ -605,7 +636,7 @@ async def register(ctx: SlashContext, ens_name):
         tx_url = get_tx_page_url(tx_key, tx)
 
         tx_db.add_tx({"tx_key": tx_key,
-                      "user": ctx.author.mention,
+                      "user": ctx.author_id,
                       "action": "commit",
                       "channel": ctx.channel_id,
                       "next_action_data": json.dumps({"name_label": name_label,
@@ -639,8 +670,9 @@ async def register(ctx: SlashContext, ens_name):
 async def send_register_finish_url(
         name_label, register_duration, owner_address, salt_bytes, set_addr_data, ctx_author, ctx_channel):
     try:
+        user = bot.get_user(int(ctx_author))
         # Add 10% to account for price fluctuation; the difference is refunded.
-        rent_price_wei = eth_registrar.functions.rentPrice(name_label, register_duration).call()[0]
+        rent_price_wei = eth_registrar_controller.functions.rentPrice(name_label, register_duration).call()[0]
         rent_price_wei = int(float(rent_price_wei) * 1.1)
         rent_price_eth = web3.from_wei(rent_price_wei, "ether")
 
@@ -656,8 +688,8 @@ async def send_register_finish_url(
         ]
 
         tx = {
-            "to": eth_registrar.address,
-            "data": compress_string_to_url(eth_registrar.encodeABI(fn_name="register", args=args)),
+            "to": eth_registrar_controller.address,
+            "data": compress_string_to_url(eth_registrar_controller.encodeABI(fn_name="register", args=args)),
             "value": rent_price_wei
         }
 
@@ -683,11 +715,9 @@ async def send_register_finish_url(
             url=tx_url
         )
 
-        channel = bot.get_channel(ctx_channel)
-
-        await channel.send(f"{ctx_author} Great! Now you are just a step away from registering `{ens_name}`. ",
-                           embeds=embed,
-                           ephemeral=True)
+        await user.send(f"Great! Now you are just a step away from registering `{ens_name}`. ",
+                        embeds=embed,
+                        ephemeral=True)
     except Exception as e:
         logger.error(f"Error in send_register_finish_url {str(e)}")
         raise e
@@ -697,7 +727,7 @@ async def send_register_congrats(ens_name, owner_address, ctx_author, ctx_channe
     try:
         channel = bot.get_channel(ctx_channel)
         await channel.send(
-            f"Great news! `{ens_name}` is now owned by {ctx_author}, who can now proudly call it their own!")
+            f"Great news! `{ens_name}` is now owned by {mention(ctx_author)}, who can now proudly call it their own!")
     except Exception as e:
         logger.error(f"Error in send_register_finish_url {str(e)}")
         raise e
@@ -715,7 +745,7 @@ async def commit_callback(tx, tx_hash, next_action_data):
                                        ctx_channel=int(tx["channel"]),
                                        ctx_author=tx["user"])
     except Exception as e:
-        logger.error(f"Error in action_commit {str(e)}")
+        logger.error(f"Error in commit_callback {str(e)}")
         raise e
 
 
@@ -727,7 +757,7 @@ async def register_callback(tx, tx_hash, next_action_data):
                                      ctx_channel=int(tx["channel"]),
                                      ctx_author=tx["user"])
     except Exception as e:
-        logger.error(f"Error in action_register {str(e)}")
+        logger.error(f"Error in register_callback {str(e)}")
         raise e
 
 
@@ -739,9 +769,48 @@ async def buy_callback(tx, tx_hash, next_action_data):
         price = next_action_data["price"]
         ctx_author = tx["user"]
         await channel.send(
-            f"Exciting announcement! `{ens_name}` has been successfully purchased by {ctx_author} for `{price}` ETH!")
+            f"Exciting announcement! `{ens_name}` has been successfully purchased by {mention(ctx_author)} for `{price}` ETH!")
     except Exception as e:
-        logger.error(f"Error in action_register {str(e)}")
+        logger.error(f"Error in buy_callback {str(e)}")
+        raise e
+
+
+async def sell_callback(tx, tx_signature, next_action_data):
+    try:
+        channel = bot.get_channel(int(tx["channel"]))
+        user = bot.get_user(int(tx["user"]))
+
+        ctx_author = tx["user"]
+
+        order_params = {
+            "parameters": next_action_data,
+            "signature": tx_signature,
+            "protocol_address": get_contract_address("Seaport")
+        }
+
+        logger.info(order_params)
+
+        headers = {
+            "accept": "application/json",
+            "X-API-KEY": opensea_api_key,
+            "content-type": "application/json"
+        }
+
+        response = await http_client.post(get_opensea_url('listings'), json=order_params, headers=headers)
+        response = response.json()
+
+        # logger.info(response)
+
+        if "errors" in response:
+            await user.send(
+                f"Apologies, an error occurred while attempting to send your order to OpenSea.\n"
+                f"```{response['errors'][0]}```")
+            return
+
+        await channel.send(
+            f"{user.mention} your name has been succesfully listed on OpenSea")
+    except Exception as e:
+        logger.error(f"Error in sell_callback {str(e)}")
         raise e
 
 
@@ -755,12 +824,12 @@ async def user_post():
     json_data = json.loads(data.decode())
     logger.info(f'Received POST data: {json_data}')
     tx_key = json_data["txKey"]
-    tx_hash = json_data["txHash"]
+    tx_result = json_data["txResult"]
 
-    if not tx_key or not tx_hash or not tx_db.tx_key_exists(tx_key):
+    if not tx_key or not tx_result or not tx_db.tx_key_exists(tx_key):
         abort(400, description='Transaction key is invalid')
 
-    tx_db.update_tx_hash(tx_key, tx_hash)
+    tx_db.update_tx_result(tx_key, tx_result)
     tx = tx_db.get_tx(tx_key)
 
     logger.info(f'TX {tx}')
@@ -768,11 +837,13 @@ async def user_post():
     next_action_data = json.loads(tx["next_action_data"])
 
     if tx["action"] == "commit":
-        asyncio.create_task(commit_callback(tx, tx_hash, next_action_data))
+        asyncio.create_task(commit_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "register":
-        asyncio.create_task(register_callback(tx, tx_hash, next_action_data))
+        asyncio.create_task(register_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "buy":
-        asyncio.create_task(buy_callback(tx, tx_hash, next_action_data))
+        asyncio.create_task(buy_callback(tx, tx_result, next_action_data))
+    elif tx["action"] == "sell":
+        asyncio.create_task(sell_callback(tx, tx_result, next_action_data))
 
     return jsonify({"status": "success"})
 
