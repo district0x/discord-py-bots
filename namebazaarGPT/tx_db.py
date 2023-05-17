@@ -12,7 +12,7 @@ class TxDB:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS tx (
                     tx_key TEXT,
-                    tx_hash TEXT,
+                    tx_result TEXT,
                     user TEXT,
                     action TEXT,
                     channel TEXT,
@@ -56,16 +56,16 @@ class TxDB:
             ''', (user, action))
             return cursor.fetchall()
 
-    def update_tx_hash(self, tx_key, tx_hash):
+    def update_tx_result(self, tx_key, tx_result):
         with sqlite3.connect(self.db_file) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                UPDATE tx SET tx_hash = ? WHERE tx_key = ? AND tx_hash IS NULL
-            ''', (tx_hash, tx_key))
+                UPDATE tx SET tx_result = ? WHERE tx_key = ? AND tx_result IS NULL
+            ''', (tx_result, tx_key))
             conn.commit()
             if cursor.rowcount == 0:
                 raise ValueError(
-                    f"Failed to update tx_hash for tx_key={tx_key}. tx_hash may not be empty or tx_key may not exist.")
+                    f"Failed to update tx_result for tx_key={tx_key}. tx_result may not be empty or tx_key may not exist.")
 
     def tx_key_exists(self, tx_key):
         with sqlite3.connect(self.db_file) as conn:
