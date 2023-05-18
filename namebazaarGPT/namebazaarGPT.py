@@ -16,6 +16,7 @@ from web3 import Web3
 from quart import Quart, request, jsonify, abort
 import nest_asyncio
 from tx_db import TxDB
+from user_address_db import UserAddressDB
 import hashlib
 from quart_cors import cors
 import httpx
@@ -78,7 +79,8 @@ intents.guilds = True
 intents.message_content = True
 intents.members = True
 
-tx_db = TxDB('tx.db')
+tx_db = TxDB('nb.db')
+user_address_db = UserAddressDB('nb.db')
 bot = Client(intents=intents)
 
 
@@ -360,6 +362,39 @@ async def test(ctx: SlashContext):
     await ctx.send("This is just a test")
 
 
+async def _connect_wallet(ctx: SlashContext, ctx_message):
+    tx_key = generate_tx_key()
+
+    json_data = json.dumps({"nickname": ctx.author.nickname})
+
+    tx_db.add_tx({"tx_key": tx_key,
+                  "user": ctx.author_id,
+                  "action": "connect_wallet",
+                  "channel": ctx.channel_id,
+                  "next_action_data": json_data})
+
+    tx = {
+        "to": "",
+        "data": compress_string_to_url(json_data),
+        "value": 0
+    }
+
+    tx_url = get_tx_page_url(tx_key, tx, sign_spec="ConnectWallet")
+
+    embed = Embed(
+        title=f"Link your Ethereum Wallet with NameBazaarBot",
+        description=f"This will open your MetaMask...",
+        color=BrandColors.WHITE,
+        url=tx_url)
+
+    await ctx.send(ctx_message, embeds=embed, ephemeral=True)
+
+
+@slash_command(name="connect_wallet", description="Link your Ethereum address to your Discord account.")
+async def connect_wallet(ctx: SlashContext):
+    await _connect_wallet(ctx, "Let's get this linking stuff done, so we can start trading!")
+
+
 @slash_command(name="sell", description="Sell ENS name")
 @slash_option(
     name="ens_name",
@@ -518,8 +553,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
             color=BrandColors.GREEN,
             url=tx_url)
 
-        await ctx.send(f"", embeds=embed,
-                       ephemeral=True)
+        await ctx.send(f"", embeds=embed, ephemeral=True)
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
