@@ -9,8 +9,9 @@ import openai
 import pinecone
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
-from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, File
-from interactions.models.discord import Embed, BrandColors
+from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, File, \
+    component_callback, ComponentContext
+from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
 from web3 import Web3
 from quart import Quart, request, jsonify, abort
 import nest_asyncio
@@ -155,8 +156,8 @@ def less_hours_passed(start_time, hours):
     return time_passed < datetime.timedelta(hours=hours)
 
 
-def get_tx_key(tx):
-    return hashlib.sha256(f"{tx['to']}{tx['data']}{tx['value']}".encode()).hexdigest()[:32]
+def generate_tx_key():
+    return hashlib.sha256(f"{random.randint(10, 999999999999999)}".encode()).hexdigest()[:32]
 
 
 def namehash(name):
@@ -231,30 +232,24 @@ async def on_ready():
     logger.info("Bot is ready")
 
 
-@slash_command(name="buy", description="Buy ENS name")
-@slash_option(
-    name="ens_name",
-    description="Please provide the ENS name that you wish to buy.",
-    required=True,
-    opt_type=OptionType.STRING,
-    max_length=100,
-    min_length=3
-)
-async def buy(ctx: SlashContext, ens_name):
+async def _buy(ctx, ens_name):
     try:
+        ens_name = add_eth_suffix(ens_name)
+        cured_name = ens_cure(ens_name)
 
-        if not is_top_level_eth(ens_name):
+        if not is_top_level_eth(cured_name):
             await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
                            ephemeral=True)
             return
 
-        ens_name = add_eth_suffix(ens_name)
-        cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
 
         label_hash = Web3.keccak(text=name_label)
-        token_id = int.from_bytes(label_hash, byteorder='big')
-        logger.info(f"token id: {token_id}")
+        node = namehash(cured_name)
+        unwrapped_token_id = int.from_bytes(label_hash, byteorder='big')
+        wrapped_token_id = int.from_bytes(node, byteorder='big')
+
+        is_wrapped = name_wrapper.functions.isWrapped(node).call()
 
         headers = {
             "accept": "application/json",
@@ -262,24 +257,30 @@ async def buy(ctx: SlashContext, ens_name):
         }
 
         url = f"{get_opensea_url('listings')}?" \
-              f"asset_contract_address={get_contract_address('ETHRegistrar')}&" \
-              f"token_ids={token_id}"
+              f"asset_contract_address={name_wrapper.address if is_wrapped else eth_registrar.address}&" \
+              f"token_ids={wrapped_token_id if is_wrapped else unwrapped_token_id}&" \
+              f"order_by=eth_price&" \
+              f"order_direction=asc"
 
         response = await http_client.get(url, headers=headers)
 
-        listings = json.loads(response.text)
+        listings = response.json()
 
-        if not listings["orders"]:
-            await ctx.send(f"It appears that `{ens_name}` is not currently listed for sale on OpenSea.", ephemeral=True)
+        if not "orders" in listings:
+            await ctx.send(f"It appears that `{cured_name}` is not currently listed for sale on OpenSea.",
+                           ephemeral=True)
             return
+
+        order_hash = listings["orders"][0]["order_hash"]
+        protocol_address = listings["orders"][0]["protocol_address"]
 
         url = get_opensea_url("fulfillment")
 
         payload = {
             "listing": {
-                "hash": listings["orders"][0]["order_hash"],
+                "hash": order_hash,
                 "chain": "ethereum",
-                "protocol_address": listings["orders"][0]["protocol_address"]
+                "protocol_address": protocol_address
             },
             "fulfiller": {
                 "address": "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
@@ -307,30 +308,56 @@ async def buy(ctx: SlashContext, ens_name):
             "data": compress_string_to_url(tx_data),
             "value": tx_value
         }
-        tx_key = get_tx_key(tx)
+        tx_key = generate_tx_key()
         tx_url = get_tx_page_url(tx_key, tx)
+        price = str(round(web3.from_wei(tx_value, "ether"), 4))
 
         tx_db.add_tx({"tx_key": tx_key,
                       "user": ctx.author_id,
                       "action": "buy",
                       "channel": ctx.channel_id,
                       "next_action_data": json.dumps({"ens_name": cured_name,
-                                                      "price": str(round(web3.from_wei(tx_value, "ether"), 4))})})
+                                                      "price": price})})
 
         embed = Embed(
             title=f"Buy `{cured_name}`",
             description=f"Click to buy `{cured_name}`",
+            fields=[{"name": "Price", "value": f"{price} ETH"}],
             color=BrandColors.GREEN,
             url=tx_url)
 
-        await ctx.send(f"You are about to buy `{cured_name}`.", embeds=embed,
-                       ephemeral=True)
+        await ctx.send(f"You are about to buy `{cured_name}`.", embeds=embed, ephemeral=True)
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
         await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of `{ens_name}`.",
                        ephemeral=True)
         logger.error(f"Buy command exception {str(e)}")
+        raise e
+
+
+@slash_command(name="buy", description="Buy ENS name")
+@slash_option(
+    name="ens_name",
+    description="Please provide the ENS name that you wish to buy.",
+    required=True,
+    opt_type=OptionType.STRING,
+    max_length=100,
+    min_length=3
+)
+async def buy(ctx: SlashContext, ens_name):
+    await _buy(ctx, ens_name)
+
+
+@component_callback(re.compile(r"^buy_btn_"))
+async def my_callback(ctx: ComponentContext):
+    ens_name = re.sub(r"^buy_btn_", "", ctx.custom_id)
+    await _buy(ctx, ens_name)
+
+
+@slash_command(name="test", description="This command is for testing purposes")
+async def test(ctx: SlashContext):
+    await ctx.send("This is just a test")
 
 
 @slash_command(name="sell", description="Sell ENS name")
@@ -350,13 +377,13 @@ async def buy(ctx: SlashContext, ens_name):
 )
 @slash_option(
     name="end_price",
-    description="Specify the final selling price for your name in ETH.",
+    description="Specify the final selling price for your name in ETH. If empty, it equals the start price.",
     required=False,
     opt_type=OptionType.NUMBER,
 )
 @slash_option(
     name="duration_days",
-    description="Specify the duration, in days, for which your listing will remain valid. (default 100 days)",
+    description="Specify the duration, in days, for which your listing will remain valid. Default is 100 days)",
     required=False,
     opt_type=OptionType.INTEGER,
     min_value=1,
@@ -472,7 +499,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
             "value": 0
         }
 
-        tx_key = get_tx_key(tx)
+        tx_key = generate_tx_key()
         tx_url = get_tx_page_url(tx_key, tx, sign_spec="OSCreateListing")
 
         tx_db.add_tx({"tx_key": tx_key,
@@ -632,7 +659,7 @@ async def register(ctx: SlashContext, ens_name):
             "value": 0
         }
 
-        tx_key = get_tx_key(tx)
+        tx_key = generate_tx_key()
         tx_url = get_tx_page_url(tx_key, tx)
 
         tx_db.add_tx({"tx_key": tx_key,
@@ -693,7 +720,7 @@ async def send_register_finish_url(
             "value": rent_price_wei
         }
 
-        tx_key = get_tx_key(tx)
+        tx_key = generate_tx_key()
         tx_url = get_tx_page_url(tx_key, tx)
 
         ens_name = add_eth_suffix(name_label)
@@ -799,16 +826,47 @@ async def sell_callback(tx, tx_signature, next_action_data):
         response = await http_client.post(get_opensea_url('listings'), json=order_params, headers=headers)
         response = response.json()
 
-        # logger.info(response)
-
         if "errors" in response:
             await user.send(
                 f"Apologies, an error occurred while attempting to send your order to OpenSea.\n"
                 f"```{response['errors'][0]}```")
             return
 
-        await channel.send(
-            f"{user.mention} your name has been succesfully listed on OpenSea")
+        order = response["order"]
+        asset = order["maker_asset_bundle"]["assets"][0]
+        token_id = asset["token_id"]
+        contract_address = asset["asset_contract"]["address"]
+        ens_name = asset["name"]
+        expiration_date = datetime.datetime.fromtimestamp(order["expiration_time"])
+
+        logger.info(f"price {order['current_price']}")
+        price = round(Web3.from_wei(int(order["current_price"]), "ether"), 3)
+
+        embed = Embed(
+            title=f"View `{ens_name}` on OpenSea",
+            fields=[
+                {"name": "Price", "value": f"{price} ETH", "inline": True},
+                {"name": "Expiration", "value": expiration_date.strftime("%Y-%m-%d"), "inline": True}
+            ],
+            color=BrandColors.GREEN,
+            url=f"https://opensea.io/assets/ethereum/{contract_address}/{token_id}"
+        )
+
+        await user.send(f"Well done! Your listing for `{ens_name}` has been successfully added to OpenSea!",
+                        embeds=embed)
+
+        components = Button(
+            style=ButtonStyle.GREEN,
+            emoji="🤑",
+            label=f"Buy {ens_name}",
+            custom_id=f"buy_btn_{ens_name}",
+        )
+
+        await channel.send(f"{user.mention} has just added `{ens_name}` for sale at the price of `{price} ETH!`",
+                           components=components)
+
+
+
     except Exception as e:
         logger.error(f"Error in sell_callback {str(e)}")
         raise e
