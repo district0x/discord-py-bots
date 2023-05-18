@@ -3,274 +3,300 @@
 <head>
     <meta charset="utf-8">
     <title>Ethereum Transaction</title>
-    <!-- Include MetaMask provider library -->
     <script src="https://unpkg.com/@metamask/detect-provider/dist/detect-provider.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/web3/1.9.0/web3.min.js"
-            integrity="sha512-mUvdtCaVKd9dby/UnYGKMLkP3eT7EA6QNFN5iSEjvMf8TFPq2oZFIemWL46iypQcL8xYNdx7wQIA1oYnTXuYhg=="
-            crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
 
 </head>
 <body>
 <script type="text/javascript">
-const signTxSpecs = {
-  "OSCreateListing": {
-    "name": "Seaport",
-    "version": "1.5",
-    "primaryType": "OrderComponents",
-    "types": {
-        "EIP712Domain": [
-            {"name": "name", "type": "string"},
-            {"name": "version", "type": "string"},
-            {"name": "chainId", "type": "uint256"},
-            {"name": "verifyingContract", "type": "address"}
-        ],
-         OrderComponents: [
-            { name: "offerer", type: "address" },
-            { name: "zone", type: "address" },
-            { name: "offer", type: "OfferItem[]" },
-            { name: "consideration", type: "ConsiderationItem[]" },
-            { name: "orderType", type: "uint8" },
-            { name: "startTime", type: "uint256" },
-            { name: "endTime", type: "uint256" },
-            { name: "zoneHash", type: "bytes32" },
-            { name: "salt", type: "uint256" },
-            { name: "conduitKey", type: "bytes32" },
-            { name: "counter", type: "uint256" }
-          ],
-          OfferItem: [
-            { name: "itemType", type: "uint8" },
-            { name: "token", type: "address" },
-            { name: "identifierOrCriteria", type: "uint256" },
-            { name: "startAmount", type: "uint256" },
-            { name: "endAmount", type: "uint256" },
-          ],
-          ConsiderationItem: [
-            { name: "itemType", type: "uint8" },
-            { name: "token", type: "address" },
-            { name: "identifierOrCriteria", type: "uint256" },
-            { name: "startAmount", type: "uint256" },
-            { name: "endAmount", type: "uint256" },
-            { name: "recipient", type: "address" },
-          ],
-    }
-  }
-}
-
-let accounts = [];
-let provider = false;
-
-async function checkMetaMask() {
-  provider = await detectEthereumProvider();
-
-  if (provider) {
-    console.log("MetaMask installed");
-  } else {
-    var body = document.body;
-    body.textContent = "Please install MetaMask browser extension";
-  }
-}
-
-function decompressFromUrl(compressed) {
-  var urlDecoded = decodeURIComponent(compressed);
-  var base64Decoded = atob(urlDecoded);
-  var bytes = [].map.call(base64Decoded, function(c) {
-    return c.charCodeAt(0);
-  });
-  var binaryData = new Uint8Array(bytes);
-  var decompressed = pako.inflate(binaryData, {
-    to: 'string'
-  });
-  return decompressed;
-}
-
-function getHostURL() {
-    let host = getURLParameter("host");
-    let port = getURLParameter("port");
-
-    const protocol = host.includes('district0x') ? 'https' : 'http';
-    return `${protocol}://${host}:${port}/tx`;
-}
-
-async function sendTransaction() {
-
-  if (typeof BigInt === "undefined") {
-    let body = document.body;
-    body.textContent = "BigInt is not supported in this browser";
-    console.log("BigInt is not supported in this browser");
-  }
-
-  const txParams = {
-    to: getURLParameter("to"),
-    from: accounts[0],
-    value: "0x" + BigInt(getURLParameter("value")).toString(16),
-    data: decompressFromUrl(getURLParameter("data"))
-  };
-
-  console.log(txParams);
-
-  try {
-    const txResult = await ethereum.request({
-      method: 'eth_sendTransaction',
-      params: [txParams],
-    });
-
-    const txKey = getURLParameter("tx_key");
-
-    fetch(getHostURL(), {
-      method: 'POST',
-      body: JSON.stringify({
-        txKey,
-        txResult
-      }),
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    }).then(response => {
-      if (response.ok) {
-        let body = document.body;
-        body.textContent = "Your transaction has been successfully sent, you can close this tab now.";
-      } else {
-        let body = document.body;
-        body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
-        console.log(response);
-      }
-    }).catch(error => {
-      let body = document.body;
-      body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
-      console.log(error);
-    });
-  } catch (error) {
-    console.error(error);
-    document.body.textContent = "Transaction has not been sent";
-  }
-}
-
-async function signTransaction() {
-  const txParams = {
-    to: getURLParameter("to"),
-    from: accounts[0],
-    data: decompressFromUrl(getURLParameter("data"))
-  };
-
-  const specKey = getURLParameter("sign_spec")
-  const message = JSON.parse(txParams["data"]);
-
-  msgParams = JSON.stringify({
-    domain: {
-      chainId: 1,
-      name: signTxSpecs[specKey]['name'],
-      verifyingContract: txParams['to'],
-      version: signTxSpecs[specKey]['version'],
-    },
-    message: message,
-    primaryType: signTxSpecs[specKey]['primaryType'],
-    types: signTxSpecs[specKey]['types']
-  });
-
-  console.log(message);
-  console.log(message.salt);
-
-  return await ethereum.sendAsync({
-    method: 'eth_signTypedData_v4',
-    params: [accounts[0], msgParams],
-    from: accounts[0]
-  }, function(err, response) {
-    let body = document.body;
-    if (err) {
-        body.textContent = "Apologies, but there was an issue with signing the data.";
-        return;
+    const signTxSpecs = {
+        "OSCreateListing": {
+            "signMethod": "signTypedData",
+            "name": "Seaport",
+            "version": "1.5",
+            "primaryType": "OrderComponents",
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"}
+                ],
+                OrderComponents: [
+                    {name: "offerer", type: "address"},
+                    {name: "zone", type: "address"},
+                    {name: "offer", type: "OfferItem[]"},
+                    {name: "consideration", type: "ConsiderationItem[]"},
+                    {name: "orderType", type: "uint8"},
+                    {name: "startTime", type: "uint256"},
+                    {name: "endTime", type: "uint256"},
+                    {name: "zoneHash", type: "bytes32"},
+                    {name: "salt", type: "uint256"},
+                    {name: "conduitKey", type: "bytes32"},
+                    {name: "counter", type: "uint256"}
+                ],
+                OfferItem: [
+                    {name: "itemType", type: "uint8"},
+                    {name: "token", type: "address"},
+                    {name: "identifierOrCriteria", type: "uint256"},
+                    {name: "startAmount", type: "uint256"},
+                    {name: "endAmount", type: "uint256"},
+                ],
+                ConsiderationItem: [
+                    {name: "itemType", type: "uint8"},
+                    {name: "token", type: "address"},
+                    {name: "identifierOrCriteria", type: "uint256"},
+                    {name: "startAmount", type: "uint256"},
+                    {name: "endAmount", type: "uint256"},
+                    {name: "recipient", type: "address"},
+                ],
+            }
+        },
+        "ConnectWallet": {
+            "signMethod": "personalSign",
+            "messageTemplate": (data) =>
+                `Hi ${data.username}!
+To connect your Discord account with your Ethereum address for district0x discord server, please sign this message.
+This will allow the bot to link your Discord account with your Ethereum address and provide you with the desired functionalities.
+Thanks!
+district0x
+Connected address: ${data.address}`
+        }
     }
 
-    const txKey = getURLParameter("tx_key");
-    const txResult = response.result;
+    let accounts = [];
+    let provider = false;
 
-    fetch(getHostURL(), {
-      method: 'POST',
-      body: JSON.stringify({
-        txKey,
-        txResult
-      }),
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    }).then(response => {
-      if (response.ok) {
-        body.textContent = "Your data was successfully signed and sent to the Discord. You can close this tab now.";
-      } else {
-        body.textContent = "Your data was signed, but we failed to reach our Discord.";
-        console.log(response);
-      }
-    }).catch(error => {
-      body.textContent = "Your data was signed, but we failed to reach our Discord.";
-      console.log(error);
-    });
+    async function checkMetaMask() {
+        provider = await detectEthereumProvider();
 
-    console.log(response);
-  });
-}
-
-async function getAccount() {
-  try {
-    accounts = await ethereum.request({
-      method: 'eth_requestAccounts'
-    });
-    console.log(accounts);
-  } catch (error) {
-    console.error(error);
-    let body = document.body;
-    body.textContent = "Account has not been selected";
-  }
-}
-
-function getURLParameter(name) {
-  const searchParams = new URLSearchParams(window.location.search);
-  return searchParams.get(name);
-}
-
-function isMobileDevice() {
-  const mobileDeviceRegex = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i;
-  return mobileDeviceRegex.test(navigator.userAgent);
-}
-
-function openMetamaskDapp() {
-  let url = window.location.href;
-  let newLocation = url.slice(url.indexOf("//") + 2);
-  window.location.href = "https://metamask.app.link/dapp/" + newLocation;
-}
-
-function checkPassedHost() {
-  const allowedHostnames = /^localhost$|^127(?:\.[0-9]+){0,2}\.[0-9]+$|^(?:[a-z0-9]+\.)*district0x\.io$/;
-  const host = getURLParameter("host");
-
-  if (!allowedHostnames.test(host)) {
-    let body = document.body;
-    body.textContent = "Passed host is not allowed";
-    throw new Error("Passed host is not allowed");
-  }
-}
-
-function isSignRequest() {
-  let sign_spec = getURLParameter("sign_spec");
-  return sign_spec !== null && sign_spec !== '';
-}
-
-async function run() {
-  checkPassedHost();
-  await checkMetaMask();
-  if (!provider & isMobileDevice()) {
-    openMetamaskDapp();
-  } else if (provider) {
-    await getAccount();
-    if (isSignRequest()) {
-      await signTransaction();
-    } else {
-      await sendTransaction();
+        if (provider) {
+            console.log("MetaMask installed");
+        } else {
+            var body = document.body;
+            body.textContent = "Please install MetaMask browser extension";
+        }
     }
-  }
-}
 
-run();
+    function decompressFromUrl(compressed) {
+        var urlDecoded = decodeURIComponent(compressed);
+        var base64Decoded = atob(urlDecoded);
+        var bytes = [].map.call(base64Decoded, function (c) {
+            return c.charCodeAt(0);
+        });
+        var binaryData = new Uint8Array(bytes);
+        var decompressed = pako.inflate(binaryData, {
+            to: 'string'
+        });
+        return decompressed;
+    }
+
+    function getHostURL() {
+        let host = getURLParameter("host");
+        let port = getURLParameter("port");
+
+        const protocol = host.includes('district0x') ? 'https' : 'http';
+        return `${protocol}://${host}:${port}/tx`;
+    }
+
+    async function sendTransaction() {
+
+        if (typeof BigInt === "undefined") {
+            let body = document.body;
+            body.textContent = "BigInt is not supported in this browser";
+            console.log("BigInt is not supported in this browser");
+        }
+
+        const txParams = {
+            to: getURLParameter("to"),
+            from: accounts[0],
+            value: "0x" + BigInt(getURLParameter("value")).toString(16),
+            data: decompressFromUrl(getURLParameter("data"))
+        };
+
+        console.log(txParams);
+
+        try {
+            const txResult = await ethereum.request({
+                method: 'eth_sendTransaction',
+                params: [txParams],
+            });
+
+            const txKey = getURLParameter("tx_key");
+
+            fetch(getHostURL(), {
+                method: 'POST',
+                body: JSON.stringify({
+                    txKey,
+                    txResult
+                }),
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            }).then(response => {
+                if (response.ok) {
+                    let body = document.body;
+                    body.textContent = "Your transaction has been successfully sent, you can close this tab now.";
+                } else {
+                    let body = document.body;
+                    body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
+                    console.log(response);
+                }
+            }).catch(error => {
+                let body = document.body;
+                body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
+                console.log(error);
+            });
+        } catch (error) {
+            console.error(error);
+            document.body.textContent = "Transaction has not been sent";
+        }
+    }
+
+    async function signTransaction() {
+        const txParams = {
+            to: getURLParameter("to"),
+            from: accounts[0],
+            data: decompressFromUrl(getURLParameter("data"))
+        };
+
+        const specKey = getURLParameter("sign_spec")
+        const signSpec = signTxSpecs[specKey];
+        const data = JSON.parse(txParams["data"]);
+
+        if (signSpec.signMethod === "signTypedData") {
+            const msgParams = JSON.stringify({
+                domain: {
+                    chainId: 1,
+                    name: signSpec.name,
+                    verifyingContract: txParams.to,
+                    version: signSpec.version,
+                },
+                message: data,
+                primaryType: signSpec.primaryType,
+                types: signSpec.types
+            });
+
+            return await ethereum.sendAsync({
+                method: 'eth_signTypedData_v4',
+                params: [accounts[0], msgParams],
+                from: accounts[0]
+            }, function (err, response) {
+                let body = document.body;
+                if (err) {
+                    body.textContent = "Apologies, but there was an issue with signing the data.";
+                    return;
+                }
+
+                const txKey = getURLParameter("tx_key");
+                const txResult = response.result;
+
+                fetch(getHostURL(), {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        txKey,
+                        txResult
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                }).then(response => {
+                    if (response.ok) {
+                        body.textContent = "Your data was successfully signed and sent to the Discord. You can close this tab now.";
+                    } else {
+                        body.textContent = "Your data was signed, but we failed to reach our Discord.";
+                        console.log(response);
+                    }
+                }).catch(error => {
+                    body.textContent = "Your data was signed, but we failed to reach our Discord.";
+                    console.log(error);
+                });
+
+                console.log(response);
+            });
+        } else if (signSpec.signMethod === "personalSign") {
+            console.log(data)
+            data.address = accounts[0];
+            const message = signSpec.messageTemplate(data);
+            console.log(message)
+            const encodedMessage = new TextEncoder().encode(message);
+            const messageHex = '0x' + Array.from(encodedMessage).map(byte => byte.toString(16).padStart(2, '0')).join('');
+            console.log(messageHex)
+            window.ethereum
+                .request({
+                    method: 'personal_sign',
+                    params: [messageHex, accounts[0]],
+                })
+                .then((signature) => {
+                    console.log(`Signature: ${signature}`);
+                })
+                .catch((err) => {
+                    console.error(err);
+                });
+        }
+    }
+
+    async function getAccount() {
+        try {
+            accounts = await ethereum.request({
+                method: 'eth_requestAccounts'
+            });
+            console.log(accounts);
+        } catch (error) {
+            console.error(error);
+            let body = document.body;
+            body.textContent = "Account has not been selected";
+        }
+    }
+
+    function getURLParameter(name) {
+        const searchParams = new URLSearchParams(window.location.search);
+        return searchParams.get(name);
+    }
+
+    function isMobileDevice() {
+        const mobileDeviceRegex = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i;
+        return mobileDeviceRegex.test(navigator.userAgent);
+    }
+
+    function openMetamaskDapp() {
+        let url = window.location.href;
+        let newLocation = url.slice(url.indexOf("//") + 2);
+        window.location.href = "https://metamask.app.link/dapp/" + newLocation;
+    }
+
+    function checkPassedHost() {
+        const allowedHostnames = /^localhost$|^127(?:\.[0-9]+){0,2}\.[0-9]+$|^(?:[a-z0-9]+\.)*district0x\.io$/;
+        const host = getURLParameter("host");
+
+        if (!allowedHostnames.test(host)) {
+            let body = document.body;
+            body.textContent = "Passed host is not allowed";
+            throw new Error("Passed host is not allowed");
+        }
+    }
+
+    function isSignRequest() {
+        let sign_spec = getURLParameter("sign_spec");
+        return sign_spec !== null && sign_spec !== '';
+    }
+
+    async function run() {
+        checkPassedHost();
+        await checkMetaMask();
+        if (!provider & isMobileDevice()) {
+            openMetamaskDapp();
+        } else if (provider) {
+            await getAccount();
+            if (isSignRequest()) {
+                await signTransaction();
+            } else {
+                await sendTransaction();
+            }
+        }
+    }
+
+    run();
 </script>
 
 </body>
