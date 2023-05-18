@@ -365,7 +365,7 @@ async def test(ctx: SlashContext):
 async def _connect_wallet(ctx: SlashContext, ctx_message):
     tx_key = generate_tx_key()
 
-    json_data = json.dumps({"nickname": ctx.author.nickname})
+    json_data = json.dumps({"username": ctx.author.tag})
 
     tx_db.add_tx({"tx_key": tx_key,
                   "user": ctx.author_id,
