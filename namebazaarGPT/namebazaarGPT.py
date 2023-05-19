@@ -13,6 +13,7 @@ from interactions import listen, Client, Intents, slash_command, slash_option, S
     component_callback, ComponentContext
 from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
 from web3 import Web3
+from eth_account.messages import encode_defunct, _hash_eip191_message
 from quart import Quart, request, jsonify, abort
 import nest_asyncio
 from tx_db import TxDB
@@ -52,7 +53,8 @@ contract_addresses = {  # Make sure addresses are checksum format
         "PublicResolver": "0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63",
         "NameWrapper": "0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401",
         "Seaport": "0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC",
-        "OpenSeaConduit": "0x1E0049783F008A0085193E00003D00cd54003c71"
+        "OpenSeaConduit": "0x1E0049783F008A0085193E00003D00cd54003c71",
+        "Recover": "0x8564DAc105Ae26764467751a25DB1085B1176975"
     },
     "goerli": {
         "ETHRegistrarController": "0xCc5e7dB10E65EED1BBD105359e7268aa660f6734",
@@ -150,7 +152,7 @@ ens_registry = web3.eth.contract(address=get_contract_address("ENSRegistry"), ab
 opensea_conduit = web3.eth.contract(address=get_contract_address("OpenSeaConduit"), abi=get_abi("OpenSeaConduit"))
 seaport_abi = get_abi("Seaport")
 seaport = web3.eth.contract(address=get_contract_address("Seaport"), abi=seaport_abi)
-
+recover = web3.eth.contract(address=get_contract_address("Recover"), abi=get_abi("Recover"))
 
 def less_hours_passed(start_time, hours):
     now = datetime.datetime.now()
@@ -362,14 +364,14 @@ async def test(ctx: SlashContext):
     await ctx.send("This is just a test")
 
 
-async def _connect_wallet(ctx: SlashContext, ctx_message):
+async def _link_wallet(ctx: SlashContext, ctx_message):
     tx_key = generate_tx_key()
 
     json_data = json.dumps({"username": ctx.author.tag})
 
     tx_db.add_tx({"tx_key": tx_key,
                   "user": ctx.author_id,
-                  "action": "connect_wallet",
+                  "action": "link_wallet",
                   "channel": ctx.channel_id,
                   "next_action_data": json_data})
 
@@ -379,7 +381,7 @@ async def _connect_wallet(ctx: SlashContext, ctx_message):
         "value": 0
     }
 
-    tx_url = get_tx_page_url(tx_key, tx, sign_spec="ConnectWallet")
+    tx_url = get_tx_page_url(tx_key, tx, sign_spec="LinkWallet")
 
     embed = Embed(
         title=f"Link your Ethereum Wallet with NameBazaarBot",
@@ -390,9 +392,9 @@ async def _connect_wallet(ctx: SlashContext, ctx_message):
     await ctx.send(ctx_message, embeds=embed, ephemeral=True)
 
 
-@slash_command(name="connect_wallet", description="Link your Ethereum address to your Discord account.")
-async def connect_wallet(ctx: SlashContext):
-    await _connect_wallet(ctx, "Let's get this linking stuff done, so we can start trading!")
+@slash_command(name="link_wallet", description="Link your Ethereum address to your Discord account.")
+async def link_wallet(ctx: SlashContext):
+    await _link_wallet(ctx, "Let's get this linking stuff done, so we can start trading!")
 
 
 @slash_command(name="sell", description="Sell ENS name")
@@ -898,11 +900,33 @@ async def sell_callback(tx, tx_signature, next_action_data):
 
         await channel.send(f"{user.mention} has just added `{ens_name}` for sale at the price of `{price} ETH!`",
                            components=components)
-
-
-
     except Exception as e:
         logger.error(f"Error in sell_callback {str(e)}")
+        raise e
+
+
+async def link_wallet_callback(tx, tx_signature, address, message, next_action_data):
+    try:
+        user = bot.get_user(int(tx["user"]))
+        logger.info(f"address {address}")
+        logger.info(f"message: {message}")
+        logger.info(f"next action {next_action_data}")
+        logger.info(tx_signature)
+
+        message = encode_defunct(hexstr=message)
+        message_hash = _hash_eip191_message(message)
+        hex_message_hash = Web3.to_hex(message_hash)
+        sig = Web3.to_bytes(hexstr=tx_signature)
+        v, hex_r, hex_s = Web3.to_int(sig[-1]), Web3.to_hex(sig[:32]), Web3.to_hex(sig[32:64])
+
+        signer = recover.functions.ecr(hex_message_hash, v, hex_r, hex_s).call()
+
+        logger.info(f"signer: {signer}")
+
+        await user.send(f"Thank you. Your Ethereum address has been successfully linked to your Discord account. "
+                        f"Feel free to start trading some ENS names now!")
+    except Exception as e:
+        logger.error(f"link_wallet_callback {str(e)}")
         raise e
 
 
@@ -921,6 +945,9 @@ async def user_post():
     if not tx_key or not tx_result or not tx_db.tx_key_exists(tx_key):
         abort(400, description='Transaction key is invalid')
 
+    if tx_db.tx_result_exists(tx_key):
+        abort(409, description="This transaction has already been processed")
+
     tx_db.update_tx_result(tx_key, tx_result)
     tx = tx_db.get_tx(tx_key)
 
@@ -936,6 +963,9 @@ async def user_post():
         asyncio.create_task(buy_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "sell":
         asyncio.create_task(sell_callback(tx, tx_result, next_action_data))
+    elif tx["action"] == "link_wallet":
+        asyncio.create_task(link_wallet_callback
+                            (tx, tx_result, json_data["address"], json_data["message"], next_action_data))
 
     return jsonify({"status": "success"})
 

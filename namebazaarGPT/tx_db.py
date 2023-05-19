@@ -74,3 +74,11 @@ class TxDB:
                 SELECT EXISTS(SELECT 1 FROM tx WHERE tx_key = ? LIMIT 1)
             ''', (tx_key,))
             return bool(cursor.fetchone()[0])
+
+    def tx_result_exists(self, tx_key):
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT EXISTS(SELECT 1 FROM tx WHERE tx_key = ? AND tx_result IS NOT NULL LIMIT 1)
+            ''', (tx_key,))
+            return bool(cursor.fetchone()[0])
