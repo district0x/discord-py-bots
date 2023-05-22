@@ -154,6 +154,7 @@ seaport_abi = get_abi("Seaport")
 seaport = web3.eth.contract(address=get_contract_address("Seaport"), abi=seaport_abi)
 recover = web3.eth.contract(address=get_contract_address("Recover"), abi=get_abi("Recover"))
 
+
 def less_hours_passed(start_time, hours):
     now = datetime.datetime.now()
     time_passed = now - start_time
@@ -246,6 +247,12 @@ async def _buy(ctx, ens_name):
                            ephemeral=True)
             return
 
+        user_address = user_address_db.get_address(ctx.author_id)
+        if user_address is None:
+            await _link_wallet(ctx,
+                               "To buy an ENS name, we need your Ethereum address associated with your Discord account.")
+            return
+
         name_label = remove_eth_suffix(cured_name)
 
         label_hash = Web3.keccak(text=name_label)
@@ -287,7 +294,7 @@ async def _buy(ctx, ens_name):
                 "protocol_address": protocol_address
             },
             "fulfiller": {
-                "address": "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
+                "address": user_address
             }
         }
 
@@ -397,6 +404,125 @@ async def link_wallet(ctx: SlashContext):
     await _link_wallet(ctx, "Let's get this linking stuff done, so we can start trading!")
 
 
+@slash_command(name="unlink_wallet", description="Unlink your Ethereum address from your Discord account.")
+async def unlink_wallet(ctx: SlashContext):
+    user_address_db.remove_user(ctx.author_id)
+    await ctx.send(f"Your Ethereum address was successfully unlinked from your Discord account.", ephemeral=True)
+
+
+async def _approve_opensea(ctx: SlashContext, user_address, nft_contract, ens_name, token_id, is_wrapped, start_price,
+                           end_price, duration_days):
+    tx_key = generate_tx_key()
+
+    tx_db.add_tx({"tx_key": tx_key,
+                  "user": ctx.author_id,
+                  "action": "approve_opensea",
+                  "channel": ctx.channel_id,
+                  "next_action_data": json.dumps({"ens_name": ens_name,
+                                                  "user_address": user_address,
+                                                  "start_price": start_price,
+                                                  "end_price": end_price,
+                                                  "duration_days": duration_days,
+                                                  "token_id": token_id,
+                                                  "is_wrapped": is_wrapped})})
+
+    tx_data = nft_contract.encodeABI(fn_name="setApprovalForAll", args=[opensea_conduit.address, True])
+
+    tx = {
+        "to": nft_contract.address,
+        "data": compress_string_to_url(tx_data),
+        "value": 0
+    }
+
+    tx_url = get_tx_page_url(tx_key, tx)
+
+    embed = Embed(
+        title=f"Approve OpenSea to transfer ENS names",
+        description=f"This will open your MetaMask...",
+        color=BrandColors.YELLOW,
+        url=tx_url
+    )
+
+    return await ctx.send(
+        "In order to sell this name, you will need to perform the following approval transaction for OpenSea.",
+        embeds=embed, ephemeral=True)
+
+
+async def _send_sell_sign_url(ctx, token_id, ens_name, user_address, is_wrapped, start_price, end_price, duration_days,
+                              ctx_author_id, ctx_channel_id):
+    start_time = int(datetime.datetime.now().timestamp())
+    end_time = int((datetime.datetime.now() + datetime.timedelta(days=duration_days)).timestamp())
+
+    start_price_wei = Web3.to_wei(start_price, "ether")
+    end_price_wei = Web3.to_wei(end_price, "ether")
+    owner_start_price, fees_start_price = split_opensea_consideration(start_price_wei)
+    owner_end_price, fees_end_price = split_opensea_consideration(end_price_wei)
+
+    order_params = {
+        "offerer": user_address,
+        "offer": [{
+            "itemType": 3 if is_wrapped else 2,
+            "token": name_wrapper.address if is_wrapped else eth_registrar.address,
+            "identifierOrCriteria": str(token_id),
+            "startAmount": 1,
+            "endAmount": 1
+        }],
+        "consideration": [{
+            "itemType": 0,
+            "token": "0x0000000000000000000000000000000000000000",
+            "identifierOrCriteria": 0,
+            "startAmount": str(owner_start_price),
+            "endAmount": str(owner_end_price),
+            "recipient": user_address,
+        }, {  ## OpenSea Fees have to be defined, at least 2.5%
+            "itemType": 0,
+            "token": "0x0000000000000000000000000000000000000000",
+            "identifierOrCriteria": 0,
+            "startAmount": str(fees_start_price),
+            "endAmount": str(fees_end_price),
+            "recipient": "0x0000a26b00c1F0DF003000390027140000fAa719",
+        }],
+        "totalOriginalConsiderationItems": 2,
+        "startTime": start_time,
+        "endTime": end_time,
+        "orderType": 1,
+        "zone": "0x004C00500000aD104D7DBd00e3ae0A5C00560C00",
+        "zoneHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "salt": str(generate_opensea_salt()),
+        "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
+        "counter": 0,
+    }
+
+    order_params_json = json.dumps(order_params)
+
+    tx = {
+        "to": seaport.address,
+        "data": compress_string_to_url(order_params_json),
+        "value": 0
+    }
+
+    tx_key = generate_tx_key()
+    tx_url = get_tx_page_url(tx_key, tx, sign_spec="OSCreateListing")
+
+    tx_db.add_tx({"tx_key": tx_key,
+                  "user": ctx_author_id,
+                  "action": "sell",
+                  "channel": ctx_channel_id,
+                  "next_action_data": order_params_json})
+
+    embed = Embed(
+        title=f"Sign the sales contract for `{ens_name}`",
+        description=f"To initiate the selling process for `{ens_name}`, please click on the link above.\n"
+                    f"Upon clicking this, the URL will open in your browser, which will then automatically launch"
+                    f" your MetaMask browser extension or the app on the mobile. Please make sure you have "
+                    f"the MetaMask installed.\n"
+                    f"You will be notified once we are ready to proceed with the second step of the registration process.",
+        color=BrandColors.GREEN,
+        url=tx_url)
+
+    return await ctx.send(f"", embeds=embed, ephemeral=True)
+
+
 @slash_command(name="sell", description="Sell ENS name")
 @slash_option(
     name="ens_name",
@@ -428,7 +554,11 @@ async def link_wallet(ctx: SlashContext):
 )
 async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duration_days=100):
     try:
-        connected_address = "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
+        user_address = user_address_db.get_address(ctx.author_id)
+        if user_address is None:
+            await _link_wallet(ctx,
+                               "In order to facilitate the sale of your ENS name, we need your Ethereum address associated with your Discord account.")
+            return
 
         if end_price is None:
             end_price = start_price
@@ -481,81 +611,37 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
             token_id = int.from_bytes(node, byteorder='big')
             is_wrapped = True
 
-        if owner is None or owner.lower() != connected_address.lower():
+        if owner is None or owner.lower() != user_address.lower():
             await ctx.send(f"It appears that you don't own `{cured_name}`.", ephemeral=True)
             return
 
-        start_time = int(datetime.datetime.now().timestamp())
-        end_time = int((datetime.datetime.now() + datetime.timedelta(days=duration_days)).timestamp())
+        nft_contract = name_wrapper if is_wrapped else eth_registrar
+        is_approved = nft_contract.functions.isApprovedForAll(user_address, opensea_conduit.address).call()
 
-        start_price_wei = Web3.to_wei(start_price, "ether")
-        end_price_wei = Web3.to_wei(end_price, "ether")
-        owner_start_price, fees_start_price = split_opensea_consideration(start_price_wei)
-        owner_end_price, fees_end_price = split_opensea_consideration(end_price_wei)
+        logger.info(f"is_approved: {is_approved}")
 
-        order_params = {
-            "offerer": connected_address,
-            "offer": [{
-                "itemType": 3 if is_wrapped else 2,
-                "token": name_wrapper.address if is_wrapped else eth_registrar.address,
-                "identifierOrCriteria": str(token_id),
-                "startAmount": 1,
-                "endAmount": 1
-            }],
-            "consideration": [{
-                "itemType": 0,
-                "token": "0x0000000000000000000000000000000000000000",
-                "identifierOrCriteria": 0,
-                "startAmount": str(owner_start_price),
-                "endAmount": str(owner_end_price),
-                "recipient": connected_address,
-            }, {  ## OpenSea Fees have to be defined, at least 2.5%
-                "itemType": 0,
-                "token": "0x0000000000000000000000000000000000000000",
-                "identifierOrCriteria": 0,
-                "startAmount": str(fees_start_price),
-                "endAmount": str(fees_end_price),
-                "recipient": "0x0000a26b00c1F0DF003000390027140000fAa719",
-            }],
-            "totalOriginalConsiderationItems": 2,
-            "startTime": start_time,
-            "endTime": end_time,
-            "orderType": 1,
-            "zone": "0x004C00500000aD104D7DBd00e3ae0A5C00560C00",
-            "zoneHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "salt": str(generate_opensea_salt()),
-            "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
-            "counter": 0,
-        }
+        if not is_approved:
+            await _approve_opensea(ctx=ctx,
+                                   user_address=user_address,
+                                   ens_name=ens_name,
+                                   token_id=token_id,
+                                   is_wrapped=is_wrapped,
+                                   nft_contract=nft_contract,
+                                   start_price=start_price,
+                                   end_price=end_price,
+                                   duration_days=duration_days)
+            return
 
-        order_params_json = json.dumps(order_params)
-
-        tx = {
-            "to": seaport.address,
-            "data": compress_string_to_url(order_params_json),
-            "value": 0
-        }
-
-        tx_key = generate_tx_key()
-        tx_url = get_tx_page_url(tx_key, tx, sign_spec="OSCreateListing")
-
-        tx_db.add_tx({"tx_key": tx_key,
-                      "user": ctx.author_id,
-                      "action": "sell",
-                      "channel": ctx.channel_id,
-                      "next_action_data": order_params_json})
-
-        embed = Embed(
-            title=f"Sign the sales contract for `{cured_name}`",
-            description=f"To initiate the selling process for `{cured_name}`, please click on the link above.\n"
-                        f"Upon clicking this, the URL will open in your browser, which will then automatically launch"
-                        f" your MetaMask browser extension or the app on the mobile. Please make sure you have "
-                        f"the MetaMask installed.\n"
-                        f"You will be notified once we are ready to proceed with the second step of the registration process.",
-            color=BrandColors.GREEN,
-            url=tx_url)
-
-        await ctx.send(f"", embeds=embed, ephemeral=True)
+        return await _send_sell_sign_url(ctx=ctx,
+                                         user_address=user_address,
+                                         ens_name=ens_name,
+                                         token_id=token_id,
+                                         is_wrapped=is_wrapped,
+                                         start_price=start_price,
+                                         end_price=end_price,
+                                         duration_days=duration_days,
+                                         ctx_author_id=ctx.author_id,
+                                         ctx_channel_id=ctx.channel_id)
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
     except Exception as e:
@@ -587,6 +673,8 @@ async def _owned_names(ctx: SlashContext, owner_address):
         response = await http_client.post(subgraph_url, json={"query": query})
         data = response.json()
 
+        logger.info(f"datA: {data}")
+
         if "data" in data:
             account = data["data"]["account"]
             if account:
@@ -603,12 +691,11 @@ async def _owned_names(ctx: SlashContext, owner_address):
                 unique_sorted_names = sorted(list(set(combined_names)))
 
                 formatted_names = "\n".join(unique_sorted_names)
-                await ctx.send(f"```\n{formatted_names}```", ephemeral=True)
-
+                return await ctx.send(f"```\n{formatted_names}```", ephemeral=True)
             else:
-                await ctx.send("Apologies, but no matching account was found for this address", ephemeral=True)
+                return await ctx.send("Apologies, but no matching account was found for this address", ephemeral=True)
         else:
-            await ctx.send(
+            return ctx.send(
                 "Apologies, an error occurred while fetching data from the subgraph. Please try again later.",
                 ephemeral=True)
     except Exception as e:
@@ -630,10 +717,29 @@ async def owned_names(ctx: SlashContext, owner_address):
     await _owned_names(ctx, owner_address)
 
 
-@slash_command(name="my_names", description="Shows list of names owned by your connected address")
+@slash_command(name="my_names", description="Shows list of names owned by your linked wallet address")
 async def my_names(ctx: SlashContext):
-    connected_address = "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
-    await _owned_names(ctx, connected_address)
+    try:
+        user_address = user_address_db.get_address(ctx.author_id)
+        if user_address is None:
+            await _link_wallet(ctx,
+                               "To display your owned ENS names, it requires your Ethereum address linked to your Discord account.")
+        else:
+            await _owned_names(ctx, user_address)
+    except Exception as e:
+        logger.error(f"my_names {str(e)}")
+        await ctx.respond('An error occurred: {}'.format(str(e)))
+        raise e
+
+
+@slash_command(name="my_wallet", description="Shows your currently linked wallet address")
+async def my_wallet(ctx: SlashContext):
+    user_address = user_address_db.get_address(ctx.author_id)
+    if user_address is None:
+        await ctx.send("You currently don't have any Ethereum address linked with your Discord account.",
+                       ephemeral=True)
+    else:
+        await ctx.send(f"Your currently linked address is: `{user_address}`", ephemeral=True)
 
 
 @slash_command(name="register", description="Registers ENS name")
@@ -647,18 +753,17 @@ async def my_names(ctx: SlashContext):
 )
 async def register(ctx: SlashContext, ens_name):
     register_duration = 31536000
-    logger.info(f"register {ens_name}")
-    owner_address = "0x0940f7D6E7ad832e0085533DD2a114b424d5E83A"
 
     try:
+        user_address = user_address_db.get_address(ctx.author_id)
+        if user_address is None:
+            await _link_wallet(ctx,
+                               "To register your ENS name, we need your Ethereum address associated with your Discord account.")
+            return
+
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
         name_label = remove_eth_suffix(cured_name)
-
-        if not Web3.is_checksum_address(owner_address):
-            await ctx.send(f"It appears that the Ethereum address you provided is not valid. "
-                           f"Please provide the address in checksum format", ephemeral=True)
-            return
 
         if "." in name_label:
             await ctx.send(f"We apologize for the inconvenience, but at the moment, we do not offer support for "
@@ -674,13 +779,13 @@ async def register(ctx: SlashContext, ens_name):
             return
 
         node = namehash(ens_name)
-        set_addr_data = public_resolver.encodeABI(fn_name="setAddr", args=[node, owner_address])[2:]
+        set_addr_data = public_resolver.encodeABI(fn_name="setAddr", args=[node, user_address])[2:]
 
         salt_bytes = os.urandom(32)
 
         commitment = eth_registrar_controller.functions.makeCommitment(
             name_label,
-            owner_address,
+            user_address,
             register_duration,
             salt_bytes,
             public_resolver.address,
@@ -703,7 +808,7 @@ async def register(ctx: SlashContext, ens_name):
                       "action": "commit",
                       "channel": ctx.channel_id,
                       "next_action_data": json.dumps({"name_label": name_label,
-                                                      "owner_address": owner_address,
+                                                      "owner_address": user_address,
                                                       "register_duration": register_duration,
                                                       "salt_hex": salt_bytes.hex(),
                                                       "set_addr_data": set_addr_data})})
@@ -778,19 +883,7 @@ async def send_register_finish_url(
             url=tx_url
         )
 
-        await user.send(f"Great! Now you are just a step away from registering `{ens_name}`. ",
-                        embeds=embed,
-                        ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in send_register_finish_url {str(e)}")
-        raise e
-
-
-async def send_register_congrats(ens_name, owner_address, ctx_author, ctx_channel):
-    try:
-        channel = bot.get_channel(ctx_channel)
-        await channel.send(
-            f"Great news! `{ens_name}` is now owned by {mention(ctx_author)}, who can now proudly call it their own!")
+        await user.send(f"Great! Now you are just a step away from registering `{ens_name}`. ", embeds=embed)
     except Exception as e:
         logger.error(f"Error in send_register_finish_url {str(e)}")
         raise e
@@ -815,10 +908,9 @@ async def commit_callback(tx, tx_hash, next_action_data):
 async def register_callback(tx, tx_hash, next_action_data):
     try:
         await wait_for_receipt(tx_hash)
-        await send_register_congrats(ens_name=next_action_data["ens_name"],
-                                     owner_address=next_action_data["owner_address"],
-                                     ctx_channel=int(tx["channel"]),
-                                     ctx_author=tx["user"])
+        channel = bot.get_channel(int(tx["channel"]))
+        await channel.send(
+            f"Great news! `{ens_name}` is now owned by {mention(tx['user'])}, who can now proudly call it their own!")
     except Exception as e:
         logger.error(f"Error in register_callback {str(e)}")
         raise e
@@ -874,8 +966,8 @@ async def sell_callback(tx, tx_signature, next_action_data):
         contract_address = asset["asset_contract"]["address"]
         ens_name = asset["name"]
         expiration_date = datetime.datetime.fromtimestamp(order["expiration_time"])
+        logger.info(f"asset: {asset}")
 
-        logger.info(f"price {order['current_price']}")
         price = round(Web3.from_wei(int(order["current_price"]), "ether"), 3)
 
         embed = Embed(
@@ -908,10 +1000,6 @@ async def sell_callback(tx, tx_signature, next_action_data):
 async def link_wallet_callback(tx, tx_signature, address, message, next_action_data):
     try:
         user = bot.get_user(int(tx["user"]))
-        logger.info(f"address {address}")
-        logger.info(f"message: {message}")
-        logger.info(f"next action {next_action_data}")
-        logger.info(tx_signature)
 
         message = encode_defunct(hexstr=message)
         message_hash = _hash_eip191_message(message)
@@ -921,12 +1009,37 @@ async def link_wallet_callback(tx, tx_signature, address, message, next_action_d
 
         signer = recover.functions.ecr(hex_message_hash, v, hex_r, hex_s).call()
 
-        logger.info(f"signer: {signer}")
+        if not Web3.is_address(signer):
+            await user.send(f"We apologize, but we were unable to retrieve the Ethereum address from your signature.")
+            logger.error(f"Invalid address recovered from signature: {signer}")
+            return
 
-        await user.send(f"Thank you. Your Ethereum address has been successfully linked to your Discord account. "
-                        f"Feel free to start trading some ENS names now!")
+        user_address_db.add_user_address(tx["user"], Web3.to_checksum_address(signer), tx["tx_key"], tx_signature)
+
+        await user.send(
+            f"Thank you. Your Ethereum address `{signer}` has been successfully linked with your Discord account. "
+            f"Feel free to start trading some ENS names now!")
     except Exception as e:
         logger.error(f"link_wallet_callback {str(e)}")
+        raise e
+
+
+async def approve_opensea_callback(tx, tx_hash, next_action_data):
+    try:
+        await wait_for_receipt(tx_hash)
+        user = bot.get_user(int(tx["user"]))
+        await _send_sell_sign_url(ctx=user,
+                                  start_price=next_action_data["start_price"],
+                                  end_price=next_action_data["end_price"],
+                                  duration_days=next_action_data["duration_days"],
+                                  user_address=next_action_data["user_address"],
+                                  ens_name=next_action_data["ens_name"],
+                                  token_id=next_action_data["token_id"],
+                                  is_wrapped=next_action_data["is_wrapped"],
+                                  ctx_author_id=tx["user"],
+                                  ctx_channel_id=tx["channel"])
+    except Exception as e:
+        logger.error(f"Error in approve_opensea_callback {str(e)}")
         raise e
 
 
@@ -945,10 +1058,10 @@ async def user_post():
     if not tx_key or not tx_result or not tx_db.tx_key_exists(tx_key):
         abort(400, description='Transaction key is invalid')
 
-    if tx_db.tx_result_exists(tx_key):
-        abort(409, description="This transaction has already been processed")
+    # if tx_db.tx_result_exists(tx_key):
+    #     abort(409, description="This transaction has already been processed")
 
-    tx_db.update_tx_result(tx_key, tx_result)
+    # tx_db.update_tx_result(tx_key, tx_result)
     tx = tx_db.get_tx(tx_key)
 
     logger.info(f'TX {tx}')
@@ -963,6 +1076,8 @@ async def user_post():
         asyncio.create_task(buy_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "sell":
         asyncio.create_task(sell_callback(tx, tx_result, next_action_data))
+    elif tx["action"] == "approve_opensea":
+        asyncio.create_task(approve_opensea_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "link_wallet":
         asyncio.create_task(link_wallet_callback
                             (tx, tx_result, json_data["address"], json_data["message"], next_action_data))

@@ -15,7 +15,7 @@ class UserAddressDB:
                     tx_key TEXT,
                     signature TEXT,
                     updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user, address)
+                    PRIMARY KEY (user)
                 )
             ''')
             conn.commit()
@@ -54,3 +54,12 @@ class UserAddressDB:
                 return result[0]
             else:
                 return None
+
+    def remove_user(self, user):
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM user_address
+                WHERE user = ?
+            ''', (user,))
+            conn.commit()
