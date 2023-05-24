@@ -78,7 +78,7 @@ opeansea_urls = {
 
 subgraph_url = "https://api.thegraph.com/subgraphs/name/ensdomains/ens"
 
-intents = Intents.MESSAGES
+intents = Intents.DEFAULT
 intents.messages = True
 intents.guilds = True
 intents.message_content = True
@@ -140,6 +140,7 @@ def get_tx_page_url(tx_key, tx_data, sign_spec=None):
     base_url = f"{tx_page_url}?" \
                f"tx_key={tx_key}&" \
                f"to={tx_data['to']}&" \
+               f"from={tx_data.get('from', '')}&" \
                f"data={tx_data['data']}&" \
                f"value={tx_data['value']}&" \
                f"host={server_host}&" \
@@ -223,6 +224,41 @@ def prepare_tx_parameters(parameters):
     return parameters
 
 
+def recursive_values(data):
+    if isinstance(data, dict):
+        return tuple(recursive_values(v) if isinstance(v, (dict, list)) else v for v in data.values())
+    elif isinstance(data, list):
+        return [recursive_values(v) if isinstance(v, (dict, list)) else v for v in data]
+    else:
+        return data
+
+
+def prepare_tx_args(data):
+    if isinstance(data, dict):
+        # Prepare the dictionary items
+        for key in data:
+            if isinstance(data[key], str):
+                if data[key].isdigit():
+                    # Convert numeric strings to integers
+                    data[key] = int(data[key])
+                elif data[key].startswith('0x') and len(data[key]) == 42:
+                    # Convert Ethereum addresses to checksum format
+                    data[key] = Web3.to_checksum_address(data[key])
+                    # Convert hex strings to bytes
+                    # data[key] = bytes.fromhex(data[key][2:])
+            elif isinstance(data[key], list):
+                # Recursively prepare parameters in lists
+                data[key] = [prepare_tx_args(param) if isinstance(param, dict) else param for param in
+                             data[key]]
+
+        # Extract values
+        return tuple(prepare_tx_args(v) if isinstance(v, (dict, list)) else v for v in data.values())
+    elif isinstance(data, list):
+        return [prepare_tx_args(v) if isinstance(v, (dict, list)) else v for v in data]
+    else:
+        return data
+
+
 def compress_string_to_url(s):
     compressed = zlib.compress(s.encode())
     encoded = base64.b64encode(compressed)
@@ -240,11 +276,11 @@ def split_opensea_consideration(wei_value):
 
 def get_consideration_token_contract(token_address):
     token_mapping = {
-        usdc.address: ("usdc", usdc),
-        weth.address: ("weth", weth),
-        dai.address: ("dai", dai)
+        usdc.address.lower(): ("usdc", usdc),
+        weth.address.lower(): ("weth", weth),
+        dai.address.lower(): ("dai", dai)
     }
-    return token_mapping.get(token_address, ("eth", None))
+    return token_mapping.get(token_address.lower(), ("eth", None))
 
 
 def format_wei_price(price, token_name="eth"):
@@ -262,8 +298,8 @@ async def on_ready():
     logger.info("Bot is ready")
 
 
-async def approve_erc20_allowance(ctx: SlashContext, ens_name, price, consider_token_name, consider_token_contract,
-                                  buy_tx_to, buy_tx_data, buy_tx_value):
+async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, price, allowance, consider_token_name,
+                                  consider_token_contract, buy_tx_to, buy_tx_data, buy_tx_value):
     tx_key = generate_tx_key()
 
     tx_db.add_tx({"tx_key": tx_key,
@@ -274,6 +310,7 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, price, consider_t
                                                   "price": price,
                                                   "consider_token_name": consider_token_name,
                                                   "buy_tx_to": buy_tx_to,
+                                                  "buy_tx_from": user_address,
                                                   "buy_tx_data": buy_tx_data,
                                                   "buy_tx_value": buy_tx_value})})
 
@@ -281,6 +318,7 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, price, consider_t
 
     tx = {
         "to": consider_token_contract.address,
+        "from": user_address,
         "data": compress_string_to_url(tx_data),
         "value": 0
     }
@@ -295,6 +333,9 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, price, consider_t
         fields=[{"name": "ENS name", "value": ens_name, "inline": True},
                 {"name": "Price",
                  "value": f"{format_wei_price(price, consider_token_name)} {token_symbol}",
+                 "inline": True},
+                {"name": "Current Allowance",
+                 "value": f"{format_wei_price(allowance, consider_token_name)} {token_symbol}",
                  "inline": True}],
         color=BrandColors.GREEN,
         url=tx_url)
@@ -305,12 +346,13 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, price, consider_t
         embeds=embed, ephemeral=True)
 
 
-async def send_buy_tx_url(ctx, ens_name, price, consider_token_name, tx_to, tx_data, tx_value, ctx_author_id,
+async def send_buy_tx_url(ctx, ens_name, price, consider_token_name, tx_to, tx_from, tx_data, tx_value, ctx_author_id,
                           ctx_channel_id):
     seaport = web3.eth.contract(address=tx_to, abi=seaport_abi)
 
     tx = {
         "to": tx_to,
+        "from": tx_from,
         "data": compress_string_to_url(tx_data),
         "value": tx_value
     }
@@ -371,21 +413,25 @@ async def _buy(ctx, ens_name):
               f"asset_contract_address={name_wrapper.address if is_wrapped else eth_registrar.address}&" \
               f"token_ids={wrapped_token_id if is_wrapped else unwrapped_token_id}&" \
               f"order_by=eth_price&" \
-              f"order_direction=asc"
+              f"order_direction=asc&" \
+              f"limit=1"
 
         response = await http_client.get(url, headers=headers)
 
         listings = response.json()
 
-        if not "orders" in listings:
+        if not "orders" in listings or len(listings["orders"]) == 0:
             await ctx.send(f"It appears that `{cured_name}` is not currently listed for sale on OpenSea.",
                            ephemeral=True)
             return
+
+        # logger.info(listings)
 
         cheapest_order = listings["orders"][0]
         order_hash = cheapest_order["order_hash"]
         protocol_address = cheapest_order["protocol_address"]
         current_price = int(cheapest_order["current_price"])
+        order_type = cheapest_order["order_type"]
 
         url = get_opensea_url("fulfillment")
 
@@ -403,16 +449,28 @@ async def _buy(ctx, ens_name):
         response = await http_client.post(url, json=payload, headers=headers)
         fulfillment = response.json()
 
+        logger.info("----------------------------------------")
+        # logger.info(fulfillment)
+
         tx_to = Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])
         fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
         fn_name = fn_signature.split("(")[0]
-
-        args_dict = prepare_tx_parameters(fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"])
-
-        tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(args_dict.values())])
         tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
 
-        consider_token = args_dict["considerationToken"]
+        logger.info(f"order_type: {order_type}")
+        if order_type == "basic":
+            parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
+            consider_token = parameters["considerationToken"]
+            args = prepare_tx_args(parameters)
+            tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(args)])
+
+        elif order_type == "dutch":
+            order = fulfillment["fulfillment_data"]["transaction"]["input_data"]["order"]
+            consider_token = order["parameters"]["consideration"][0]["token"]
+            fulfiller_conduit_key = fulfillment["fulfillment_data"]["transaction"]["input_data"]["fulfillerConduitKey"]
+            order_args = prepare_tx_args(order)
+            tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(order_args), fulfiller_conduit_key])
+
         (consider_token_name, consider_token_contract) = get_consideration_token_contract(consider_token)
 
         if consider_token_name != "eth":
@@ -421,7 +479,9 @@ async def _buy(ctx, ens_name):
             if allowance < current_price:
                 return await approve_erc20_allowance(ctx=ctx,
                                                      ens_name=cured_name,
+                                                     user_address=user_address,
                                                      price=current_price,
+                                                     allowance=allowance,
                                                      consider_token_name=consider_token_name,
                                                      consider_token_contract=consider_token_contract,
                                                      buy_tx_to=tx_to,
@@ -432,6 +492,7 @@ async def _buy(ctx, ens_name):
                                      ens_name=cured_name,
                                      price=current_price,
                                      tx_to=tx_to,
+                                     tx_from=user_address,
                                      tx_data=tx_data,
                                      tx_value=tx_value,
                                      consider_token_name=consider_token_name,
@@ -530,6 +591,7 @@ async def _approve_opensea(ctx: SlashContext, user_address, nft_contract, ens_na
 
     tx = {
         "to": nft_contract.address,
+        "from": user_address,
         "data": compress_string_to_url(tx_data),
         "value": 0
     }
@@ -597,6 +659,7 @@ async def send_sell_sign_url(ctx, token_id, ens_name, user_address, is_wrapped, 
 
     tx = {
         "to": seaport.address,
+        "from": user_address,
         "data": compress_string_to_url(order_params_json),
         "value": 0
     }
@@ -892,6 +955,7 @@ async def register(ctx: SlashContext, ens_name):
 
         tx = {
             "to": eth_registrar_controller.address,
+            "from": user_address,
             "data": compress_string_to_url(eth_registrar_controller.encodeABI(fn_name="commit", args=[commitment])),
             "value": 0
         }
@@ -948,6 +1012,7 @@ async def send_register_finish_url(
 
         tx = {
             "to": eth_registrar_controller.address,
+            "from": owner_address,
             "data": compress_string_to_url(eth_registrar_controller.encodeABI(fn_name="register", args=args)),
             "value": rent_price_wei
         }
@@ -1019,7 +1084,7 @@ async def buy_callback(tx, tx_hash, next_action_data):
         ctx_author = tx["user"]
         await channel.send(
             f"Exciting announcement! `{ens_name}` has been successfully purchased by {mention(ctx_author)} "
-            f"for `{formatted_price}` {token_name.upper()}!")
+            f"for `{formatted_price} {token_name.upper()}`!")
     except Exception as e:
         logger.error(f"Error in buy_callback {str(e)}")
         raise e
@@ -1095,7 +1160,7 @@ async def sell_callback(tx, tx_signature, next_action_data):
         raise e
 
 
-async def link_wallet_callback(tx, tx_signature, address, message, next_action_data):
+async def link_wallet_callback(tx, tx_signature, message, next_action_data):
     try:
         user = bot.get_user(int(tx["user"]))
 
@@ -1152,6 +1217,7 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
                                      price=next_action_data["price"],
                                      consider_token_name=next_action_data["consider_token_name"],
                                      tx_to=next_action_data["buy_tx_to"],
+                                     tx_from=next_action_data["buy_tx_from"],
                                      tx_data=next_action_data["buy_tx_data"],
                                      tx_value=next_action_data["buy_tx_value"],
                                      ctx_author_id=tx["user"],
@@ -1182,8 +1248,6 @@ async def user_post():
     tx_db.update_tx_result(tx_key, tx_result)
     tx = tx_db.get_tx(tx_key)
 
-    logger.info(f'TX {tx}')
-
     next_action_data = json.loads(tx["next_action_data"])
 
     if tx["action"] == "commit":
@@ -1199,8 +1263,7 @@ async def user_post():
     elif tx["action"] == "approve_erc20_allowance":
         asyncio.create_task(approve_erc20_allowance_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "link_wallet":
-        asyncio.create_task(link_wallet_callback
-                            (tx, tx_result, json_data["address"], json_data["message"], next_action_data))
+        asyncio.create_task(link_wallet_callback(tx, tx_result, json_data["message"], next_action_data))
 
     return jsonify({"status": "success"})
 

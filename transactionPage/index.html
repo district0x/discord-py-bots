@@ -66,6 +66,8 @@ Linked address: ${data.address}`
 
     let accounts = [];
     let provider = false;
+    let listeningOnAccountsChanged = false;
+    let correctAccount = false;
 
     async function checkMetaMask() {
         provider = await detectEthereumProvider();
@@ -109,7 +111,7 @@ Linked address: ${data.address}`
 
         const txParams = {
             to: getURLParameter("to"),
-            from: accounts[0],
+            from: getURLParameter("from"),
             value: "0x" + BigInt(getURLParameter("value")).toString(16),
             data: decompressFromUrl(getURLParameter("data"))
         };
@@ -158,7 +160,7 @@ Linked address: ${data.address}`
     async function signTransaction() {
         const txParams = {
             to: getURLParameter("to"),
-            from: accounts[0],
+            from: getURLParameter("from"),
             data: decompressFromUrl(getURLParameter("data"))
         };
 
@@ -181,8 +183,8 @@ Linked address: ${data.address}`
 
             return await ethereum.sendAsync({
                 method: 'eth_signTypedData_v4',
-                params: [accounts[0], msgParams],
-                from: accounts[0]
+                params: [getURLParameter("from"), msgParams],
+                from: getURLParameter("from")
             }, function (err, response) {
                 let body = document.body;
                 if (err) {
@@ -229,18 +231,16 @@ Linked address: ${data.address}`
             window.ethereum
                 .request({
                     method: 'personal_sign',
-                    params: [message, accounts[0]],
+                    params: [message, data.address],
                 })
                 .then((signature) => {
                     const txKey = getURLParameter("tx_key");
                     const txResult = signature;
-                    const address = accounts[0];
                     fetch(getHostURL(), {
                         method: 'POST',
                         body: JSON.stringify({
                             txKey,
                             txResult,
-                            address,
                             message
                         }),
                         headers: {
@@ -271,6 +271,20 @@ Linked address: ${data.address}`
             accounts = await ethereum.request({
                 method: 'eth_requestAccounts'
             });
+            let body = document.body;
+            from = getURLParameter("from")
+            if (from && from.toLowerCase() !== accounts[0].toLowerCase()) {
+                correctAccount = false;
+                if (!listeningOnAccountsChanged) {
+                    window.ethereum.on("accountsChanged", popupTransaction);
+                    listeningOnAccountsChanged = true;
+                }
+                body.textContent = "Please switch your account to: " + from;
+            } else {
+                correctAccount = true;
+                body.textContent = "Please confirm your transaction.";
+            }
+            return accounts;
         } catch (error) {
             console.error(error);
             let body = document.body;
@@ -310,18 +324,24 @@ Linked address: ${data.address}`
         return sign_spec !== null && sign_spec !== '';
     }
 
+    async function popupTransaction() {
+        await getAccount();
+        if (correctAccount) {
+            if (isSignRequest()) {
+                await signTransaction();
+            } else {
+                await sendTransaction();
+            }
+        }
+    }
+
     async function run() {
         checkPassedHost();
         await checkMetaMask();
         if (!provider & isMobileDevice()) {
             openMetamaskDapp();
         } else if (provider) {
-            await getAccount();
-            if (isSignRequest()) {
-                await signTransaction();
-            } else {
-                await sendTransaction();
-            }
+            await popupTransaction();
         }
     }
 
