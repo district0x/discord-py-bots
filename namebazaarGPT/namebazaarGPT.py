@@ -294,7 +294,7 @@ def get_consideration_token_contract(token_address):
 def format_wei_price(price, token_name="eth"):
     if token_name == "usdc":
         return str(round(int(price) / 1000000, 3))
-    return str(round(web3.from_wei(int(price), "ether"), 3))
+    return str(round(web3.from_wei(int(price), "ether"), 4))
 
 
 http_client = httpx.AsyncClient()
@@ -307,7 +307,8 @@ async def on_ready():
 
 
 async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, price, allowance, token_name,
-                                  token_contract, next_tx_to, next_tx_data, next_tx_value, next_tx_order_type):
+                                  token_contract, next_tx_to, next_tx_data, next_tx_value, next_tx_order_type,
+                                  highest_bid, expiration_time):
     try:
         tx_key = generate_tx_key()
 
@@ -318,6 +319,8 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, pri
                       "next_action_data": json.dumps(
                           {"ens_name": ens_name,
                            "price": price,
+                           "highest_bid": highest_bid,
+                           "expiration_time": expiration_time,
                            "token_name": token_name,
                            "next_tx_to": next_tx_to,
                            "next_tx_from": user_address,
@@ -361,37 +364,62 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, pri
 
 
 async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_data, tx_value, ctx_author_id,
-                          ctx_channel_id, order_type):
-    seaport = web3.eth.contract(address=tx_to, abi=seaport_abi)
+                          ctx_channel_id, order_type, expiration_time, highest_bid):
+    try:
+        seaport = web3.eth.contract(address=tx_to, abi=seaport_abi)
 
-    tx = {
-        "to": tx_to,
-        "from": tx_from,
-        "data": compress_string_to_url(tx_data),
-        "value": tx_value
-    }
-    tx_key = generate_tx_key()
-    tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if order_type == "english" else None)
-    formatted_price = format_wei_price(price, token_name)
+        tx = {
+            "to": tx_to,
+            "from": tx_from,
+            "data": compress_string_to_url(tx_data),
+            "value": tx_value
+        }
+        tx_key = generate_tx_key()
+        tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if order_type == "english" else None)
+        formatted_price = format_wei_price(price, token_name)
+        token_symbol = token_name.upper()
+        expiration_datetime = datetime.datetime.fromtimestamp(expiration_time)
+        formatted_expiration = expiration_datetime.strftime("%Y-%m-%d %H:%M:%S")
 
-    tx_db.add_tx({"tx_key": tx_key,
-                  "user": ctx_author_id,
-                  "action": "buy",
-                  "channel": ctx_channel_id,
-                  "next_action_data": json.dumps(
-                      {"ens_name": ens_name,
-                       "formatted_price": formatted_price,
-                       "token_name": token_name})})
+        tx_db.add_tx({"tx_key": tx_key,
+                      "user": ctx_author_id,
+                      "action": "bid" if order_type == "english" else "buy",
+                      "channel": ctx_channel_id,
+                      "next_action_data": json.dumps(
+                          {"ens_name": ens_name,
+                           "formatted_price": formatted_price,
+                           "token_name": token_name,
+                           "order_type": order_type})})
 
-    embed = Embed(
-        title=f"Buy `{ens_name}`",
-        description=f"In order to buy `{ens_name}`, {tx_link_instruction_text}",
-        fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
-                {"name": "Price", "value": f"{formatted_price} {token_name.upper()}", "inline": True}],
-        color=BrandColors.GREEN,
-        url=tx_url)
+        if order_type == "english":
+            embed = Embed(
+                title=f"Place a `{formatted_price} {token_symbol}` bid in the {ens_name} auction",
+                description=f"In order to place a bid in the `{ens_name}` auction, {tx_link_instruction_text}",
+                fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
+                        {"name": "Your Bid", "value": f"{formatted_price} {token_symbol}", "inline": True},
+                        {"name": "Highest Bid",
+                         "value": f"{format_wei_price(highest_bid, token_name)} {token_symbol}", "inline": True},
+                        {"name": "Auction Ends", "value": formatted_expiration, "inline": True}],
+                color=BrandColors.GREEN,
+                url=tx_url)
+            return await ctx.send(f"Bid in a thrilling auction for `{ens_name}`!", embeds=embed, ephemeral=True)
+        else:
+            embed = Embed(
+                title=f"Buy `{ens_name}`",
+                description=f"In order to buy `{ens_name}`, {tx_link_instruction_text}",
+                fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
+                        {"name": "Price", "value": f"{formatted_price} {token_symbol}", "inline": True},
+                        {"name": "Offer Ends", "value": formatted_expiration}],
+                color=BrandColors.GREEN,
+                url=tx_url)
+            return await ctx.send(f"You're about to own `{ens_name}`!", embeds=embed, ephemeral=True)
 
-    return await ctx.send(f"You're about to own `{ens_name}`!", embeds=embed, ephemeral=True)
+
+    except Exception as e:
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of `{ens_name}`.",
+                       ephemeral=True)
+        logger.error(f"send_buy_tx_url exception {str(e)}")
+        raise e
 
 
 async def _buy(ctx, ens_name):
@@ -444,6 +472,7 @@ async def _buy(ctx, ens_name):
         current_price = int(cheapest_order["current_price"])
         order_type = cheapest_order["order_type"]
         cons_token = cheapest_order["protocol_data"]["parameters"]["consideration"][0]["token"]
+        expiration_time = cheapest_order["expiration_time"]
 
         url = get_opensea_url("fulfillment")
 
@@ -468,6 +497,7 @@ async def _buy(ctx, ens_name):
         fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
         fn_name = fn_signature.split("(")[0]
         tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
+        highest_bid = 0
 
         if order_type == "basic":
             parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
@@ -489,9 +519,11 @@ async def _buy(ctx, ens_name):
             response = await http_client.get(url, headers=os_api_headers)
             offers = response.json()
 
-            logger.info(offers)
+            if "orders" in offers and len(offers["orders"]) > 0:
+                highest_bid = offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"]
+                current_price = int(float(highest_bid) * 1.1)  # add 10% to the highest bid
 
-            (_, _, os_fee_start_price, _) = get_order_prices(current_price, current_price)
+            (_, _, os_fee_start_price, _) = get_order_prices(current_price)
             order_params = get_order_parameters(
                 offerer=user_address,
                 offer_item_type=1,
@@ -510,11 +542,10 @@ async def _buy(ctx, ens_name):
                 os_cons_start_amount=os_fee_start_price,
                 os_cons_end_amount=os_fee_start_price,
                 start_time=datetime.datetime.now().timestamp(),
-                end_time=int(cheapest_order["expiration_time"]) + 1,
+                end_time=int(expiration_time) + 1,
                 order_type=0)
             tx_data = json.dumps(order_params)
 
-        logger.info(f"current price: {current_price}")
         (cons_token_name, cons_token_contract) = get_consideration_token_contract(cons_token)
 
         if cons_token_name != "eth":
@@ -529,6 +560,8 @@ async def _buy(ctx, ens_name):
                     allowance=allowance,
                     token_name=cons_token_name,
                     token_contract=cons_token_contract,
+                    expiration_time=expiration_time,
+                    highest_bid=highest_bid,
                     next_tx_to=tx_to,
                     next_tx_data=tx_data,
                     next_tx_value=tx_value,
@@ -539,11 +572,13 @@ async def _buy(ctx, ens_name):
             ens_name=cured_name,
             price=current_price,
             tx_to=tx_to,
+            order_type=order_type,
+            token_name=cons_token_name,
+            expiration_time=expiration_time,
+            highest_bid=highest_bid,
             tx_from=user_address,
             tx_data=tx_data,
             tx_value=tx_value,
-            order_type=order_type,
-            token_name=cons_token_name,
             ctx_author_id=ctx.author_id,
             ctx_channel_id=ctx.channel_id)
 
@@ -664,7 +699,10 @@ def get_order_start_end_times(duration_days):
     return (start_time, end_time)
 
 
-def get_order_prices(start_price, end_price):
+def get_order_prices(start_price, end_price=None):
+    if end_price is None:
+        end_price = start_price
+
     start_price_wei = Web3.to_wei(start_price, "ether")
     owner_start_price, os_fee_start_price = split_opensea_consideration(start_price_wei)
     if start_price == end_price:
@@ -919,8 +957,6 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
 
         nft_contract = name_wrapper if is_wrapped else eth_registrar
         is_approved = nft_contract.functions.isApprovedForAll(user_address, opensea_conduit.address).call()
-
-        logger.info(f"is_approved: {is_approved}")
 
         if not is_approved:
             await _approve_opensea(ctx=ctx,
@@ -1194,13 +1230,14 @@ async def commit_callback(tx, tx_hash, next_action_data):
         await user.send(f"The registration for `{add_eth_suffix(next_action_data['name_label'])}` is underway. "
                         f"We must wait for 1 minute to complete the registration process.")
         await asyncio.sleep(61)  # The second step of the registration can be done only after 60 seconds
-        await send_register_finish_url(name_label=next_action_data["name_label"],
-                                       register_duration=int(next_action_data["register_duration"]),
-                                       owner_address=next_action_data["owner_address"],
-                                       salt_bytes=bytes.fromhex(next_action_data["salt_hex"]),
-                                       set_addr_data=next_action_data["set_addr_data"],
-                                       ctx_channel=int(tx["channel"]),
-                                       ctx_author=tx["user"])
+        await send_register_finish_url \
+            (name_label=next_action_data["name_label"],
+             register_duration=int(next_action_data["register_duration"]),
+             owner_address=next_action_data["owner_address"],
+             salt_bytes=bytes.fromhex(next_action_data["salt_hex"]),
+             set_addr_data=next_action_data["set_addr_data"],
+             ctx_channel=int(tx["channel"]),
+             ctx_author=tx["user"])
     except Exception as e:
         logger.error(f"Error in commit_callback {str(e)}")
         raise e
@@ -1217,6 +1254,21 @@ async def register_callback(tx, tx_hash, next_action_data):
         raise e
 
 
+async def bid_callback(tx, tx_signature, next_action_data):
+    try:
+        channel = bot.get_channel(int(tx["channel"]))
+        ens_name = next_action_data["ens_name"]
+        formatted_price = next_action_data["formatted_price"]
+        token_name = next_action_data["token_name"]
+        ctx_author = tx["user"]
+        return await channel.send(
+            f"Exciting announcement! `{ens_name}` has been successfully purchased by {mention(ctx_author)} "
+            f"for `{formatted_price} {token_name.upper()}`!")
+    except Exception as e:
+        logger.error(f"Error in buy_callback {str(e)}")
+        raise e
+
+
 async def buy_callback(tx, tx_hash, next_action_data):
     try:
         await wait_for_receipt(tx_hash)
@@ -1225,7 +1277,7 @@ async def buy_callback(tx, tx_hash, next_action_data):
         formatted_price = next_action_data["formatted_price"]
         token_name = next_action_data["token_name"]
         ctx_author = tx["user"]
-        await channel.send(
+        return await channel.send(
             f"Exciting announcement! `{ens_name}` has been successfully purchased by {mention(ctx_author)} "
             f"for `{formatted_price} {token_name.upper()}`!")
     except Exception as e:
@@ -1329,17 +1381,18 @@ async def approve_opensea_callback(tx, tx_hash, next_action_data):
         await wait_for_receipt(tx_hash)
         user = bot.get_user(int(tx["user"]))
         message = f"With the approval complete, we can now proceed to sell `{next_action_data['ens_name']}`."
-        return await send_sell_sign_url(ctx=user,
-                                        start_price=next_action_data["start_price"],
-                                        end_price=next_action_data["end_price"],
-                                        duration_days=next_action_data["duration_days"],
-                                        user_address=next_action_data["user_address"],
-                                        ens_name=next_action_data["ens_name"],
-                                        token_id=next_action_data["token_id"],
-                                        is_wrapped=next_action_data["is_wrapped"],
-                                        ctx_author_id=tx["user"],
-                                        ctx_channel_id=tx["channel"],
-                                        ctx_message=message)
+        return await send_sell_sign_url(
+            ctx=user,
+            start_price=next_action_data["start_price"],
+            end_price=next_action_data["end_price"],
+            duration_days=next_action_data["duration_days"],
+            user_address=next_action_data["user_address"],
+            ens_name=next_action_data["ens_name"],
+            token_id=next_action_data["token_id"],
+            is_wrapped=next_action_data["is_wrapped"],
+            ctx_author_id=tx["user"],
+            ctx_channel_id=tx["channel"],
+            ctx_message=message)
     except Exception as e:
         logger.error(f"Error in approve_opensea_callback {str(e)}")
         raise e
@@ -1349,16 +1402,20 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
     try:
         await wait_for_receipt(tx_hash)
         user = bot.get_user(int(tx["user"]))
-        return await send_buy_tx_url(ctx=user,
-                                     ens_name=next_action_data["ens_name"],
-                                     price=next_action_data["price"],
-                                     token_name=next_action_data["token_name"],
-                                     tx_to=next_action_data["next_tx_to"],
-                                     tx_from=next_action_data["next_tx_from"],
-                                     tx_data=next_action_data["next_tx_data"],
-                                     tx_value=next_action_data["next_tx_value"],
-                                     ctx_author_id=tx["user"],
-                                     ctx_channel_id=tx["channel"])
+        return await send_buy_tx_url(
+            ctx=user,
+            ens_name=next_action_data["ens_name"],
+            price=next_action_data["price"],
+            token_name=next_action_data["token_name"],
+            tx_to=next_action_data["next_tx_to"],
+            tx_from=next_action_data["next_tx_from"],
+            tx_data=next_action_data["next_tx_data"],
+            tx_value=next_action_data["next_tx_value"],
+            tx_order_type=next_action_data["next_tx_order_type"],
+            highest_bid=next_action_data["highest_bid"],
+            expiration_time=next_action_data["expiration_time"],
+            ctx_author_id=tx["user"],
+            ctx_channel_id=tx["channel"])
     except Exception as e:
         logger.error(f"Error in approve_erc20_allowance_callback {str(e)}")
         raise e
@@ -1393,6 +1450,8 @@ async def user_post():
         asyncio.create_task(register_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "buy":
         asyncio.create_task(buy_callback(tx, tx_result, next_action_data))
+    elif tx["action"] == "bid":
+        asyncio.create_task(bid_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "sell":
         asyncio.create_task(sell_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "approve_opensea":
