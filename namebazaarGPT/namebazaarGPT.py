@@ -44,6 +44,7 @@ web3_network = os.getenv('WEB3_NETWORK')
 tx_page_url = os.getenv('TX_PAGE_URL')
 server_host = os.getenv('SERVER_HOST')
 server_port = os.getenv('SERVER_PORT')
+tx_check_interval = os.getenv('TX_CHECK_INTERVAL')
 
 contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
@@ -69,11 +70,18 @@ contract_addresses = {  # Make sure addresses are checksum format
 opeansea_urls = {
     "mainnet": {
         "listings": "https://api.opensea.io/v2/orders/ethereum/seaport/listings",
-        "fulfillment": "https://api.opensea.io/v2/listings/fulfillment_data"
+        "fulfillment": "https://api.opensea.io/v2/listings/fulfillment_data",
+        "offers": "https://api.opensea.io/v2/orders/ethereum/seaport/offers"
     },
     "goerli": {
         "listings": "https://testnets-api.opensea.io/v2/orders/goerli/seaport/listings"
     }
+}
+
+os_api_headers = {
+    "accept": "application/json",
+    "X-API-KEY": opensea_api_key,
+    "content-type": "application/json"
 }
 
 subgraph_url = "https://api.thegraph.com/subgraphs/name/ensdomains/ens"
@@ -201,9 +209,9 @@ async def wait_for_receipt(tx_hash: str) -> dict:
             logger.error(f"Invalid transaction hash {tx_hash}")
         except Exception as e:
             # Thows exception when transaction hash is not yet found
-            await asyncio.sleep(15)
+            await asyncio.sleep(tx_check_interval)
             continue
-        await asyncio.sleep(15)
+        await asyncio.sleep(tx_check_interval)
     return receipt
 
 
@@ -298,56 +306,62 @@ async def on_ready():
     logger.info("Bot is ready")
 
 
-async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, price, allowance, consider_token_name,
-                                  consider_token_contract, buy_tx_to, buy_tx_data, buy_tx_value):
-    tx_key = generate_tx_key()
+async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, price, allowance, token_name,
+                                  token_contract, next_tx_to, next_tx_data, next_tx_value, next_tx_order_type):
+    try:
+        tx_key = generate_tx_key()
 
-    tx_db.add_tx({"tx_key": tx_key,
-                  "user": ctx.author_id,
-                  "action": "approve_erc20_allowance",
-                  "channel": ctx.channel_id,
-                  "next_action_data": json.dumps({"ens_name": ens_name,
-                                                  "price": price,
-                                                  "consider_token_name": consider_token_name,
-                                                  "buy_tx_to": buy_tx_to,
-                                                  "buy_tx_from": user_address,
-                                                  "buy_tx_data": buy_tx_data,
-                                                  "buy_tx_value": buy_tx_value})})
+        tx_db.add_tx({"tx_key": tx_key,
+                      "user": ctx.author_id,
+                      "action": "approve_erc20_allowance",
+                      "channel": ctx.channel_id,
+                      "next_action_data": json.dumps(
+                          {"ens_name": ens_name,
+                           "price": price,
+                           "token_name": token_name,
+                           "next_tx_to": next_tx_to,
+                           "next_tx_from": user_address,
+                           "next_tx_data": next_tx_data,
+                           "next_tx_value": next_tx_value,
+                           "next_tx_order_type": next_tx_order_type})})
+        tx_data = token_contract.encodeABI(fn_name="approve", args=[opensea_conduit.address, price])
 
-    tx_data = consider_token_contract.encodeABI(fn_name="approve", args=[opensea_conduit.address, price])
+        tx = {
+            "to": token_contract.address,
+            "from": user_address,
+            "data": compress_string_to_url(tx_data),
+            "value": 0
+        }
 
-    tx = {
-        "to": consider_token_contract.address,
-        "from": user_address,
-        "data": compress_string_to_url(tx_data),
-        "value": 0
-    }
+        tx_url = get_tx_page_url(tx_key, tx)
 
-    tx_url = get_tx_page_url(tx_key, tx)
+        token_symbol = token_name.upper()
+        embed = Embed(
+            title=f"Approve OpenSea to transfer {token_symbol}",
+            description=f"In order to approve `{token_symbol}` transfers, {tx_link_instruction_text}",
+            fields=[{"name": "ENS name", "value": ens_name, "inline": True},
+                    {"name": "Price",
+                     "value": f"{format_wei_price(price, token_name)} {token_symbol}",
+                     "inline": True},
+                    {"name": "Current Allowance",
+                     "value": f"{format_wei_price(allowance, token_name)} {token_symbol}",
+                     "inline": True}],
+            color=BrandColors.GREEN,
+            url=tx_url)
 
-    token_symbol = consider_token_name.upper()
-
-    embed = Embed(
-        title=f"Approve OpenSea to transfer {token_symbol}",
-        description=f"In order to approve `{token_symbol}` transfers, {tx_link_instruction_text}",
-        fields=[{"name": "ENS name", "value": ens_name, "inline": True},
-                {"name": "Price",
-                 "value": f"{format_wei_price(price, consider_token_name)} {token_symbol}",
-                 "inline": True},
-                {"name": "Current Allowance",
-                 "value": f"{format_wei_price(allowance, consider_token_name)} {token_symbol}",
-                 "inline": True}],
-        color=BrandColors.GREEN,
-        url=tx_url)
-
-    return await ctx.send(
-        f"To proceed with the purchase of `{ens_name}`, we first need your authorization to allow OpenSea to "
-        f"transfer `{token_symbol}` from your Ethereum address.",
-        embeds=embed, ephemeral=True)
+        return await ctx.send(
+            f"To proceed with the purchase of `{ens_name}`, we first need your authorization to allow OpenSea to "
+            f"transfer `{token_symbol}` from your Ethereum address.",
+            embeds=embed, ephemeral=True)
+    except Exception as e:
+        await ctx.send(f"I'm sorry, but an error occurred while trying to approve transactions for `{token_symbol}`.",
+                       ephemeral=True)
+        logger.error(f"approve_erc20 exception {str(e)}")
+        raise e
 
 
-async def send_buy_tx_url(ctx, ens_name, price, consider_token_name, tx_to, tx_from, tx_data, tx_value, ctx_author_id,
-                          ctx_channel_id):
+async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_data, tx_value, ctx_author_id,
+                          ctx_channel_id, order_type):
     seaport = web3.eth.contract(address=tx_to, abi=seaport_abi)
 
     tx = {
@@ -357,22 +371,23 @@ async def send_buy_tx_url(ctx, ens_name, price, consider_token_name, tx_to, tx_f
         "value": tx_value
     }
     tx_key = generate_tx_key()
-    tx_url = get_tx_page_url(tx_key, tx)
-    formatted_price = format_wei_price(price, consider_token_name)
+    tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if order_type == "english" else None)
+    formatted_price = format_wei_price(price, token_name)
 
     tx_db.add_tx({"tx_key": tx_key,
                   "user": ctx_author_id,
                   "action": "buy",
                   "channel": ctx_channel_id,
-                  "next_action_data": json.dumps({"ens_name": ens_name,
-                                                  "formatted_price": formatted_price,
-                                                  "token_name": consider_token_name})})
+                  "next_action_data": json.dumps(
+                      {"ens_name": ens_name,
+                       "formatted_price": formatted_price,
+                       "token_name": token_name})})
 
     embed = Embed(
         title=f"Buy `{ens_name}`",
         description=f"In order to buy `{ens_name}`, {tx_link_instruction_text}",
         fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
-                {"name": "Price", "value": f"{formatted_price} {consider_token_name.upper()}", "inline": True}],
+                {"name": "Price", "value": f"{formatted_price} {token_name.upper()}", "inline": True}],
         color=BrandColors.GREEN,
         url=tx_url)
 
@@ -401,22 +416,18 @@ async def _buy(ctx, ens_name):
         node = namehash(cured_name)
         unwrapped_token_id = int.from_bytes(label_hash, byteorder='big')
         wrapped_token_id = int.from_bytes(node, byteorder='big')
-
         is_wrapped = name_wrapper.functions.isWrapped(node).call()
-
-        headers = {
-            "accept": "application/json",
-            "X-API-KEY": opensea_api_key
-        }
+        asset_contract_address = name_wrapper.address if is_wrapped else eth_registrar.address
+        token_id = wrapped_token_id if is_wrapped else unwrapped_token_id
 
         url = f"{get_opensea_url('listings')}?" \
-              f"asset_contract_address={name_wrapper.address if is_wrapped else eth_registrar.address}&" \
-              f"token_ids={wrapped_token_id if is_wrapped else unwrapped_token_id}&" \
+              f"asset_contract_address={asset_contract_address}&" \
+              f"token_ids={token_id}&" \
               f"order_by=eth_price&" \
               f"order_direction=asc&" \
               f"limit=1"
 
-        response = await http_client.get(url, headers=headers)
+        response = await http_client.get(url, headers=os_api_headers)
 
         listings = response.json()
 
@@ -432,6 +443,7 @@ async def _buy(ctx, ens_name):
         protocol_address = cheapest_order["protocol_address"]
         current_price = int(cheapest_order["current_price"])
         order_type = cheapest_order["order_type"]
+        cons_token = cheapest_order["protocol_data"]["parameters"]["consideration"][0]["token"]
 
         url = get_opensea_url("fulfillment")
 
@@ -446,10 +458,10 @@ async def _buy(ctx, ens_name):
             }
         }
 
-        response = await http_client.post(url, json=payload, headers=headers)
+        response = await http_client.post(url, json=payload, headers=os_api_headers)
         fulfillment = response.json()
 
-        logger.info("----------------------------------------")
+        # logger.info("----------------------------------------")
         # logger.info(fulfillment)
 
         tx_to = Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])
@@ -457,47 +469,83 @@ async def _buy(ctx, ens_name):
         fn_name = fn_signature.split("(")[0]
         tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
 
-        logger.info(f"order_type: {order_type}")
         if order_type == "basic":
             parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
-            consider_token = parameters["considerationToken"]
             args = prepare_tx_args(parameters)
             tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(args)])
-
         elif order_type == "dutch":
             order = fulfillment["fulfillment_data"]["transaction"]["input_data"]["order"]
-            consider_token = order["parameters"]["consideration"][0]["token"]
             fulfiller_conduit_key = fulfillment["fulfillment_data"]["transaction"]["input_data"]["fulfillerConduitKey"]
             order_args = prepare_tx_args(order)
             tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(order_args), fulfiller_conduit_key])
+        elif order_type == "english":
+            url = f"{get_opensea_url('offers')}?" \
+                  f"asset_contract_address={asset_contract_address}&" \
+                  f"token_ids={token_id}&" \
+                  f"order_by=eth_price&" \
+                  f"order_direction=desc&" \
+                  f"limit=1"
 
-        (consider_token_name, consider_token_contract) = get_consideration_token_contract(consider_token)
+            response = await http_client.get(url, headers=os_api_headers)
+            offers = response.json()
 
-        if consider_token_name != "eth":
-            allowance = int(consider_token_contract.functions.allowance(user_address, opensea_conduit.address).call())
+            logger.info(offers)
+
+            (_, _, os_fee_start_price, _) = get_order_prices(current_price, current_price)
+            order_params = get_order_parameters(
+                offerer=user_address,
+                offer_item_type=1,
+                offer_token=cons_token,
+                offer_token_id=0,
+                offer_start_amount=current_price,
+                offer_end_amount=current_price,
+                cons_item_type=3 if is_wrapped else 2,
+                cons_token=name_wrapper.address if is_wrapped else eth_registrar.address,
+                cons_token_id=wrapped_token_id if is_wrapped else unwrapped_token_id,
+                cons_start_amount=1,
+                cons_end_amount=1,
+                cons_recepient=user_address,
+                os_cons_item_type=1,
+                os_cons_token=cons_token,
+                os_cons_start_amount=os_fee_start_price,
+                os_cons_end_amount=os_fee_start_price,
+                start_time=datetime.datetime.now().timestamp(),
+                end_time=int(cheapest_order["expiration_time"]) + 1,
+                order_type=0)
+            tx_data = json.dumps(order_params)
+
+        logger.info(f"current price: {current_price}")
+        (cons_token_name, cons_token_contract) = get_consideration_token_contract(cons_token)
+
+        if cons_token_name != "eth":
+            allowance = int(cons_token_contract.functions.allowance(user_address, opensea_conduit.address).call())
 
             if allowance < current_price:
-                return await approve_erc20_allowance(ctx=ctx,
-                                                     ens_name=cured_name,
-                                                     user_address=user_address,
-                                                     price=current_price,
-                                                     allowance=allowance,
-                                                     consider_token_name=consider_token_name,
-                                                     consider_token_contract=consider_token_contract,
-                                                     buy_tx_to=tx_to,
-                                                     buy_tx_data=tx_data,
-                                                     buy_tx_value=tx_value)
+                return await approve_erc20_allowance(
+                    ctx=ctx,
+                    ens_name=cured_name,
+                    user_address=user_address,
+                    price=current_price,
+                    allowance=allowance,
+                    token_name=cons_token_name,
+                    token_contract=cons_token_contract,
+                    next_tx_to=tx_to,
+                    next_tx_data=tx_data,
+                    next_tx_value=tx_value,
+                    next_tx_order_type=order_type)
 
-        return await send_buy_tx_url(ctx=ctx,
-                                     ens_name=cured_name,
-                                     price=current_price,
-                                     tx_to=tx_to,
-                                     tx_from=user_address,
-                                     tx_data=tx_data,
-                                     tx_value=tx_value,
-                                     consider_token_name=consider_token_name,
-                                     ctx_author_id=ctx.author_id,
-                                     ctx_channel_id=ctx.channel_id)
+        return await send_buy_tx_url(
+            ctx=ctx,
+            ens_name=cured_name,
+            price=current_price,
+            tx_to=tx_to,
+            tx_from=user_address,
+            tx_data=tx_data,
+            tx_value=tx_value,
+            order_type=order_type,
+            token_name=cons_token_name,
+            ctx_author_id=ctx.author_id,
+            ctx_channel_id=ctx.channel_id)
 
     except DisallowedNameError as e:
         await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
@@ -610,50 +658,145 @@ async def _approve_opensea(ctx: SlashContext, user_address, nft_contract, ens_na
         embeds=embed, ephemeral=True)
 
 
-async def send_sell_sign_url(ctx, token_id, ens_name, user_address, is_wrapped, start_price, end_price, duration_days,
-                             ctx_author_id, ctx_channel_id, ctx_message=""):
+def get_order_start_end_times(duration_days):
     start_time = int(datetime.datetime.now().timestamp())
     end_time = int((datetime.datetime.now() + datetime.timedelta(days=duration_days)).timestamp())
+    return (start_time, end_time)
 
+
+def get_order_prices(start_price, end_price):
     start_price_wei = Web3.to_wei(start_price, "ether")
-    end_price_wei = Web3.to_wei(end_price, "ether")
-    owner_start_price, fees_start_price = split_opensea_consideration(start_price_wei)
-    owner_end_price, fees_end_price = split_opensea_consideration(end_price_wei)
+    owner_start_price, os_fee_start_price = split_opensea_consideration(start_price_wei)
+    if start_price == end_price:
+        end_price_wei = start_price_wei
+        owner_end_price = owner_start_price
+        os_fee_end_price = os_fee_start_price
+    else:
+        end_price_wei = Web3.to_wei(end_price, "ether")
+        owner_end_price, os_fee_end_price = split_opensea_consideration(end_price_wei)
 
-    order_params = {
-        "offerer": user_address,
+    return (owner_start_price, owner_end_price, os_fee_start_price, os_fee_end_price)
+
+
+def get_order_parameters(offerer, offer_item_type, offer_token, offer_token_id, offer_start_amount, offer_end_amount,
+                         cons_item_type, cons_token, cons_token_id, cons_start_amount, cons_end_amount, cons_recepient,
+                         os_cons_item_type, os_cons_token, os_cons_start_amount, os_cons_end_amount, start_time,
+                         end_time, order_type):
+    return {
+        "offerer": offerer,
         "offer": [{
-            "itemType": 3 if is_wrapped else 2,
-            "token": name_wrapper.address if is_wrapped else eth_registrar.address,
-            "identifierOrCriteria": str(token_id),
-            "startAmount": 1,
-            "endAmount": 1
+            "itemType": offer_item_type,
+            "token": offer_token,
+            "identifierOrCriteria": str(offer_token_id),
+            "startAmount": str(offer_start_amount),
+            "endAmount": str(offer_end_amount)
         }],
         "consideration": [{
-            "itemType": 0,
-            "token": "0x0000000000000000000000000000000000000000",
-            "identifierOrCriteria": 0,
-            "startAmount": str(owner_start_price),
-            "endAmount": str(owner_end_price),
-            "recipient": user_address,
+            "itemType": cons_item_type,
+            "token": cons_token,
+            "identifierOrCriteria": str(cons_token_id),
+            "startAmount": str(cons_start_amount),
+            "endAmount": str(cons_end_amount),
+            "recipient": cons_recepient,
         }, {  ## OpenSea Fees have to be defined, at least 2.5%
-            "itemType": 0,
-            "token": "0x0000000000000000000000000000000000000000",
+            "itemType": os_cons_item_type,
+            "token": os_cons_token,
             "identifierOrCriteria": 0,
-            "startAmount": str(fees_start_price),
-            "endAmount": str(fees_end_price),
+            "startAmount": str(os_cons_start_amount),
+            "endAmount": str(os_cons_end_amount),
             "recipient": "0x0000a26b00c1F0DF003000390027140000fAa719",
         }],
         "totalOriginalConsiderationItems": 2,
         "startTime": start_time,
         "endTime": end_time,
-        "orderType": 1,
+        "orderType": order_type,
         "zone": "0x004C00500000aD104D7DBd00e3ae0A5C00560C00",
         "zoneHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
         "salt": str(generate_opensea_salt()),
         "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
         "counter": 0,
     }
+
+
+async def send_sell_sign_url(ctx, token_id, ens_name, user_address, is_wrapped, start_price, end_price, duration_days,
+                             ctx_author_id, ctx_channel_id, ctx_message=""):
+    start_time, end_time = get_order_start_end_times(duration_days)
+    owner_start_price, owner_end_price, os_fee_start_price, os_fee_end_price = get_order_prices(start_price, end_price)
+
+    order_params = get_order_parameters(
+        offerer=user_address,
+        offer_item_type=3 if is_wrapped else 2,
+        offer_token=name_wrapper.address if is_wrapped else eth_registrar.address,
+        offer_token_id=token_id,
+        offer_start_amount=1,
+        offer_end_amount=1,
+        cons_item_type=0,
+        cons_token="0x0000000000000000000000000000000000000000",
+        cons_token_id=0,
+        cons_start_amount=owner_start_price,
+        cons_end_amount=owner_end_price,
+        cons_recepient=user_address,
+        os_cons_item_type=0,
+        os_cons_token="0x0000000000000000000000000000000000000000",
+        os_cons_start_amount=os_fee_start_price,
+        os_cons_end_amount=os_fee_end_price,
+        start_time=start_time,
+        end_time=end_time,
+        order_type=1)
+
+    order_params_json = json.dumps(order_params)
+
+    tx = {
+        "to": seaport.address,
+        "from": user_address,
+        "data": compress_string_to_url(order_params_json),
+        "value": 0
+    }
+
+    tx_key = generate_tx_key()
+    tx_url = get_tx_page_url(tx_key, tx, sign_spec="OSCreateListing")
+
+    tx_db.add_tx({"tx_key": tx_key,
+                  "user": ctx_author_id,
+                  "action": "sell",
+                  "channel": ctx_channel_id,
+                  "next_action_data": order_params_json})
+
+    embed = Embed(
+        title=f"Sign the sales contract for `{ens_name}`",
+        description=f"To initiate the selling process for `{ens_name}`, {tx_link_instruction_text}",
+        color=BrandColors.GREEN,
+        url=tx_url)
+
+    return await ctx.send(ctx_message, embeds=embed, ephemeral=True)
+
+
+async def send_bid_sign_url(ctx,
+                            token_id, ens_name, user_address, is_wrapped, start_price, end_price, duration_days,
+                            ctx_author_id, ctx_channel_id, ctx_message=""):
+    start_time, end_time = get_order_start_end_times(duration_days)
+    owner_start_price, owner_end_price, os_fee_start_price, os_fee_end_price = get_order_prices(start_price, end_price)
+
+    order_params = get_order_parameters(
+        offerer=user_address,
+        offer_item_type=1,
+        offer_token=name_wrapper.address if is_wrapped else eth_registrar.address,
+        offer_token_id=token_id,
+        offer_start_amount=1,
+        offer_end_amount=1,
+        cons_item_type=0,
+        cons_token="0x0000000000000000000000000000000000000000",
+        cons_token_id=0,
+        cons_start_amount=owner_start_price,
+        cons_end_amount=owner_end_price,
+        cons_recepient=user_address,
+        os_cons_item_type=0,
+        os_cons_token="0x0000000000000000000000000000000000000000",
+        os_cons_start_amount=os_fee_start_price,
+        os_cons_end_amount=os_fee_end_price,
+        start_time=start_time,
+        end_time=end_time,
+        order_type=1)
 
     order_params_json = json.dumps(order_params)
 
@@ -1105,13 +1248,7 @@ async def sell_callback(tx, tx_signature, next_action_data):
 
         logger.info(order_params)
 
-        headers = {
-            "accept": "application/json",
-            "X-API-KEY": opensea_api_key,
-            "content-type": "application/json"
-        }
-
-        response = await http_client.post(get_opensea_url('listings'), json=order_params, headers=headers)
+        response = await http_client.post(get_opensea_url('listings'), json=order_params, headers=os_api_headers)
         response = response.json()
 
         if "errors" in response:
@@ -1215,11 +1352,11 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
         return await send_buy_tx_url(ctx=user,
                                      ens_name=next_action_data["ens_name"],
                                      price=next_action_data["price"],
-                                     consider_token_name=next_action_data["consider_token_name"],
-                                     tx_to=next_action_data["buy_tx_to"],
-                                     tx_from=next_action_data["buy_tx_from"],
-                                     tx_data=next_action_data["buy_tx_data"],
-                                     tx_value=next_action_data["buy_tx_value"],
+                                     token_name=next_action_data["token_name"],
+                                     tx_to=next_action_data["next_tx_to"],
+                                     tx_from=next_action_data["next_tx_from"],
+                                     tx_data=next_action_data["next_tx_data"],
+                                     tx_value=next_action_data["next_tx_value"],
                                      ctx_author_id=tx["user"],
                                      ctx_channel_id=tx["channel"])
     except Exception as e:
