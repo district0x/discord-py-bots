@@ -1,6 +1,6 @@
 import asyncio
 import binascii
-import datetime
+from datetime import datetime
 import json
 import logging
 import os
@@ -175,7 +175,7 @@ dai = web3.eth.contract(address=get_contract_address("DAI"), abi=get_abi("DAI"))
 
 
 def less_hours_passed(start_time, hours):
-    now = datetime.datetime.now()
+    now = datetime.now()
     time_passed = now - start_time
     return time_passed < datetime.timedelta(hours=hours)
 
@@ -201,7 +201,7 @@ def generate_opensea_salt():
 
 async def wait_for_receipt(tx_hash: str) -> dict:
     receipt = None
-    start = datetime.datetime.now()
+    start = datetime.now()
     while receipt is None and less_hours_passed(start, 24):
         try:
             receipt = web3.eth.get_transaction_receipt(tx_hash)
@@ -267,6 +267,34 @@ def prepare_tx_args(data):
         return data
 
 
+format_time_remaining_units = [
+    {'name': 'second', 'limit': 60, 'in_seconds': 1},
+    {'name': 'minute', 'limit': 60 * 60, 'in_seconds': 60},
+    {'name': 'hour', 'limit': 24 * 60 * 60, 'in_seconds': 60 * 60},
+    {'name': 'day', 'limit': 7 * 24 * 60 * 60, 'in_seconds': 24 * 60 * 60},
+    {'name': 'week', 'limit': 30.44 * 24 * 60 * 60, 'in_seconds': 7 * 24 * 60 * 60},
+    {'name': 'month', 'limit': 365.24 * 24 * 60 * 60, 'in_seconds': 30.44 * 24 * 60 * 60},
+    {'name': 'year', 'limit': None, 'in_seconds': 365.24 * 24 * 60 * 60}
+]
+
+
+def format_time_remaining(to_time, from_time=None):
+    if from_time is None:
+        from_time = datetime.now()
+
+    diff = (to_time - from_time).total_seconds()
+
+    if diff < 0:
+        return "Time has already passed"
+    elif diff < 5:
+        return "in a few moments"
+    else:
+        for unit in format_time_remaining_units:
+            if unit['limit'] is None or diff < unit['limit']:
+                diff = int(diff // unit['in_seconds'])
+                return f"in {diff} {unit['name']}{'s' if diff > 1 else ''}"
+
+
 def compress_string_to_url(s):
     compressed = zlib.compress(s.encode())
     encoded = base64.b64encode(compressed)
@@ -295,6 +323,12 @@ def format_wei_price(price, token_name="eth"):
     if token_name == "usdc":
         return str(round(int(price) / 1000000, 3))
     return str(round(web3.from_wei(int(price), "ether"), 4))
+
+
+def safe_to_wei(amount, token_name):
+    if token_name == "usdc":
+        return int(amount * 1000000)
+    return web3.to_wei(amount, "ether")
 
 
 http_client = httpx.AsyncClient()
@@ -378,18 +412,21 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
         tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if order_type == "english" else None)
         formatted_price = format_wei_price(price, token_name)
         token_symbol = token_name.upper()
-        expiration_datetime = datetime.datetime.fromtimestamp(expiration_time)
+        expiration_datetime = datetime.fromtimestamp(expiration_time)
         formatted_expiration = expiration_datetime.strftime("%Y-%m-%d %H:%M:%S")
 
-        tx_db.add_tx({"tx_key": tx_key,
-                      "user": ctx_author_id,
-                      "action": "bid" if order_type == "english" else "buy",
-                      "channel": ctx_channel_id,
-                      "next_action_data": json.dumps(
-                          {"ens_name": ens_name,
-                           "formatted_price": formatted_price,
-                           "token_name": token_name,
-                           "order_type": order_type})})
+        tx_db.add_tx(
+            {"tx_key": tx_key,
+             "user": ctx_author_id,
+             "action": "bid" if order_type == "english" else "buy",
+             "channel": ctx_channel_id,
+             "next_action_data": json.dumps(
+                 {"ens_name": ens_name,
+                  "formatted_price": formatted_price,
+                  "token_name": token_name,
+                  "order_type": order_type,
+                  "expiration_time": expiration_time,
+                  "order_params": tx_data if order_type == "english" else ""})})
 
         if order_type == "english":
             embed = Embed(
@@ -402,7 +439,10 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
                         {"name": "Auction Ends", "value": formatted_expiration, "inline": True}],
                 color=BrandColors.GREEN,
                 url=tx_url)
-            return await ctx.send(f"Bid in a thrilling auction for `{ens_name}`!", embeds=embed, ephemeral=True)
+            return await ctx.send(
+                f"`{ens_name}` is currently in an auction! Place your bid before it ends "
+                f"{format_time_remaining(expiration_datetime)}!",
+                embeds=embed, ephemeral=True)
         else:
             embed = Embed(
                 title=f"Buy `{ens_name}`",
@@ -422,7 +462,7 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
         raise e
 
 
-async def _buy(ctx, ens_name):
+async def _buy(ctx, ens_name, bid=None):
     try:
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
@@ -460,9 +500,8 @@ async def _buy(ctx, ens_name):
         listings = response.json()
 
         if not "orders" in listings or len(listings["orders"]) == 0:
-            await ctx.send(f"It appears that `{cured_name}` is not currently listed for sale on OpenSea.",
-                           ephemeral=True)
-            return
+            return await ctx.send(f"It appears that `{cured_name}` is not currently listed for sale on OpenSea.",
+                                  ephemeral=True)
 
         # logger.info(listings)
 
@@ -498,6 +537,7 @@ async def _buy(ctx, ens_name):
         fn_name = fn_signature.split("(")[0]
         tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
         highest_bid = 0
+        (cons_token_name, cons_token_contract) = get_consideration_token_contract(cons_token)
 
         if order_type == "basic":
             parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
@@ -519,11 +559,21 @@ async def _buy(ctx, ens_name):
             response = await http_client.get(url, headers=os_api_headers)
             offers = response.json()
 
-            if "orders" in offers and len(offers["orders"]) > 0:
-                highest_bid = offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"]
-                current_price = int(float(highest_bid) * 1.1)  # add 10% to the highest bid
+            bid_wei = None
+            if bid is not None:
+                bid_wei = safe_to_wei(bid, cons_token_name)
 
-            (_, _, os_fee_start_price, _) = get_order_prices(current_price)
+            if "orders" in offers and len(offers["orders"]) > 0:
+                highest_bid = int(offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"])
+
+                if bid_wei and highest_bid >= bid_wei:
+                    return await ctx.send(
+                        f"Sorry, but your bid is not higher than the currently highest bid of ",
+                        ephemeral=True)
+
+                current_price = highest_bid + current_price
+
+            (_, _, os_fee_start_price, _) = get_order_prices(current_price, unit="wei")
             order_params = get_order_parameters(
                 offerer=user_address,
                 offer_item_type=1,
@@ -541,12 +591,10 @@ async def _buy(ctx, ens_name):
                 os_cons_token=cons_token,
                 os_cons_start_amount=os_fee_start_price,
                 os_cons_end_amount=os_fee_start_price,
-                start_time=datetime.datetime.now().timestamp(),
-                end_time=int(expiration_time) + 1,
+                start_time=int(datetime.now().timestamp()),
+                end_time=int(expiration_time) + 604800,  # + 1 week
                 order_type=0)
             tx_data = json.dumps(order_params)
-
-        (cons_token_name, cons_token_contract) = get_consideration_token_contract(cons_token)
 
         if cons_token_name != "eth":
             allowance = int(cons_token_contract.functions.allowance(user_address, opensea_conduit.address).call())
@@ -600,8 +648,14 @@ async def _buy(ctx, ens_name):
     max_length=100,
     min_length=3
 )
-async def buy(ctx: SlashContext, ens_name):
-    await _buy(ctx, ens_name)
+@slash_option(
+    name="bid",
+    description="When participating in auctions, you can choose to specify your bid or let it be automatically calculated.",
+    required=False,
+    opt_type=OptionType.NUMBER,
+)
+async def buy(ctx: SlashContext, ens_name, bid):
+    await _buy(ctx, ens_name, bid)
 
 
 @component_callback(re.compile(r"^buy_btn_"))
@@ -694,23 +748,23 @@ async def _approve_opensea(ctx: SlashContext, user_address, nft_contract, ens_na
 
 
 def get_order_start_end_times(duration_days):
-    start_time = int(datetime.datetime.now().timestamp())
-    end_time = int((datetime.datetime.now() + datetime.timedelta(days=duration_days)).timestamp())
+    start_time = int(datetime.now().timestamp())
+    end_time = int((datetime.now() + datetime.timedelta(days=duration_days)).timestamp())
     return (start_time, end_time)
 
 
-def get_order_prices(start_price, end_price=None):
+def get_order_prices(start_price, end_price=None, unit="ether"):
     if end_price is None:
         end_price = start_price
 
-    start_price_wei = Web3.to_wei(start_price, "ether")
+    start_price_wei = Web3.to_wei(start_price, unit)
     owner_start_price, os_fee_start_price = split_opensea_consideration(start_price_wei)
     if start_price == end_price:
         end_price_wei = start_price_wei
         owner_end_price = owner_start_price
         os_fee_end_price = os_fee_start_price
     else:
-        end_price_wei = Web3.to_wei(end_price, "ether")
+        end_price_wei = Web3.to_wei(end_price, unit)
         owner_end_price, os_fee_end_price = split_opensea_consideration(end_price_wei)
 
     return (owner_start_price, owner_end_price, os_fee_start_price, os_fee_end_price)
@@ -1257,13 +1311,41 @@ async def register_callback(tx, tx_hash, next_action_data):
 async def bid_callback(tx, tx_signature, next_action_data):
     try:
         channel = bot.get_channel(int(tx["channel"]))
+        user = bot.get_user(int(tx["user"]))
+
+        ctx_author = tx["user"]
+
+        order_params = {
+            "parameters": json.loads(next_action_data["order_params"]),
+            "signature": tx_signature,
+            "protocol_address": get_contract_address("Seaport")
+        }
+
+        response = await http_client.post(get_opensea_url("offers"), json=order_params, headers=os_api_headers)
+        response = response.json()
+
+        if "errors" in response:
+            await user.send(
+                f"Apologies, an error occurred while attempting to send your order to OpenSea.\n"
+                f"```{response['errors'][0]}```")
+            return
+
         ens_name = next_action_data["ens_name"]
         formatted_price = next_action_data["formatted_price"]
         token_name = next_action_data["token_name"]
-        ctx_author = tx["user"]
+        expiration_datetime = datetime.fromtimestamp(next_action_data["expiration_time"])
+
+        components = Button(
+            style=ButtonStyle.GREEN,
+            emoji="🤑",
+            label=f"Place a bid",
+            custom_id=f"buy_btn_{ens_name}",
+        )
+
         return await channel.send(
-            f"Exciting announcement! `{ens_name}` has been successfully purchased by {mention(ctx_author)} "
-            f"for `{formatted_price} {token_name.upper()}`!")
+            f"Exciting news! {user.mention} has just placed the highest bid of `{formatted_price} {token_name.upper()}` "
+            f"in the auction for `{ens_name}`! Don't miss out and place your bid before the auction ends "
+            f"{format_time_remaining(expiration_datetime)}!", components=components)
     except Exception as e:
         logger.error(f"Error in buy_callback {str(e)}")
         raise e
@@ -1314,7 +1396,7 @@ async def sell_callback(tx, tx_signature, next_action_data):
         token_id = asset["token_id"]
         contract_address = asset["asset_contract"]["address"]
         ens_name = asset["name"]
-        expiration_date = datetime.datetime.fromtimestamp(order["expiration_time"])
+        expiration_date = datetime.fromtimestamp(order["expiration_time"])
         logger.info(f"asset: {asset}")
 
         price = format_wei_price(order["current_price"])
