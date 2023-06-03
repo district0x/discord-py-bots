@@ -27,3 +27,4 @@ python-dotenv~=1.0.0
 quart~=0.18.4
 quart-cors~=0.6.0
 httpx~=0.24.0
+httpx_cache~=0.10.0
