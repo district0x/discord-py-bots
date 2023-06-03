@@ -10,10 +10,11 @@ import pinecone
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
 from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, File, \
-    component_callback, ComponentContext
+    component_callback, ComponentContext, auto_defer
 from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
 from web3 import Web3
 from eth_account.messages import encode_defunct, _hash_eip191_message
+from decimal import Decimal, ROUND_DOWN
 from quart import Quart, request, jsonify, abort
 import nest_asyncio
 from tx_db import TxDB
@@ -310,6 +311,12 @@ def split_opensea_consideration(wei_value):
     return part1, part2
 
 
+def restrict_to_multiples(value, multiple=0.0001):
+    decimal_multiple = Decimal(str(multiple))
+    restricted_value = (value / decimal_multiple).quantize(Decimal('0'), rounding=ROUND_DOWN) * decimal_multiple
+    return restricted_value
+
+
 def get_consideration_token_contract(token_address):
     token_mapping = {
         usdc.address.lower(): ("usdc", usdc),
@@ -321,14 +328,20 @@ def get_consideration_token_contract(token_address):
 
 def format_wei_price(price, token_name="eth"):
     if token_name == "usdc":
-        return str(round(int(price) / 1000000, 3))
-    return str(round(web3.from_wei(int(price), "ether"), 4))
+        return f"{(round(int(price) / 1000000, 3))} {token_name.upper()}"
+    return f"{(round(web3.from_wei(int(price), 'ether'), 4))} {token_name.upper()}"
 
 
 def safe_to_wei(amount, token_name):
     if token_name == "usdc":
         return int(amount * 1000000)
     return web3.to_wei(amount, "ether")
+
+
+def safe_to_ether(amount, token_name):
+    if token_name == "usdc":
+        return float(amount / 1000000)
+    return web3.from_wei(amount, "ether")
 
 
 http_client = httpx.AsyncClient()
@@ -378,10 +391,10 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, pri
             description=f"In order to approve `{token_symbol}` transfers, {tx_link_instruction_text}",
             fields=[{"name": "ENS name", "value": ens_name, "inline": True},
                     {"name": "Price",
-                     "value": f"{format_wei_price(price, token_name)} {token_symbol}",
+                     "value": f"{format_wei_price(price, token_name)}",
                      "inline": True},
                     {"name": "Current Allowance",
-                     "value": f"{format_wei_price(allowance, token_name)} {token_symbol}",
+                     "value": f"{format_wei_price(allowance, token_name)}",
                      "inline": True}],
             color=BrandColors.GREEN,
             url=tx_url)
@@ -411,9 +424,10 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
         tx_key = generate_tx_key()
         tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if order_type == "english" else None)
         formatted_price = format_wei_price(price, token_name)
-        token_symbol = token_name.upper()
         expiration_datetime = datetime.fromtimestamp(expiration_time)
         formatted_expiration = expiration_datetime.strftime("%Y-%m-%d %H:%M:%S")
+
+        logger.info(f"order_type: {order_type}")
 
         tx_db.add_tx(
             {"tx_key": tx_key,
@@ -430,12 +444,12 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
 
         if order_type == "english":
             embed = Embed(
-                title=f"Place a `{formatted_price} {token_symbol}` bid in the {ens_name} auction",
+                title=f"Place a `{formatted_price}` bid in the {ens_name} auction",
                 description=f"In order to place a bid in the `{ens_name}` auction, {tx_link_instruction_text}",
                 fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
-                        {"name": "Your Bid", "value": f"{formatted_price} {token_symbol}", "inline": True},
+                        {"name": "Your Bid", "value": f"{formatted_price}", "inline": True},
                         {"name": "Highest Bid",
-                         "value": f"{format_wei_price(highest_bid, token_name)} {token_symbol}", "inline": True},
+                         "value": f"{format_wei_price(highest_bid, token_name)}", "inline": True},
                         {"name": "Auction Ends", "value": formatted_expiration, "inline": True}],
                 color=BrandColors.GREEN,
                 url=tx_url)
@@ -448,7 +462,7 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
                 title=f"Buy `{ens_name}`",
                 description=f"In order to buy `{ens_name}`, {tx_link_instruction_text}",
                 fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
-                        {"name": "Price", "value": f"{formatted_price} {token_symbol}", "inline": True},
+                        {"name": "Price", "value": f"{formatted_price}", "inline": True},
                         {"name": "Offer Ends", "value": formatted_expiration}],
                 color=BrandColors.GREEN,
                 url=tx_url)
@@ -471,12 +485,13 @@ async def _buy(ctx, ens_name, bid=None):
             await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
                            ephemeral=True)
             return
-
         user_address = user_address_db.get_address(ctx.author_id)
         if user_address is None:
-            await _link_wallet(ctx,
-                               "To buy an ENS name, we need your Ethereum address associated with your Discord account.")
-            return
+            return await _link_wallet(
+                ctx, "To buy an ENS name, we need your Ethereum address associated with your Discord account.")
+
+        if bid and float(bid) < 0.0001:
+            return await ctx.send(f"Apologies, but minimum bid on OpenSea is 0.0001", ephemeral=True)
 
         name_label = remove_eth_suffix(cured_name)
 
@@ -561,17 +576,27 @@ async def _buy(ctx, ens_name, bid=None):
 
             bid_wei = None
             if bid is not None:
+                bid = restrict_to_multiples(Decimal(str(bid)))
                 bid_wei = safe_to_wei(bid, cons_token_name)
 
             if "orders" in offers and len(offers["orders"]) > 0:
                 highest_bid = int(offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"])
 
-                if bid_wei and highest_bid >= bid_wei:
-                    return await ctx.send(
-                        f"Sorry, but your bid is not higher than the currently highest bid of ",
-                        ephemeral=True)
-
-                current_price = highest_bid + current_price
+                if bid_wei:
+                    if highest_bid >= bid_wei:
+                        return await ctx.send(
+                            f"Apologies, but your bid is not higher than the current highest bid of "
+                            f"`{format_wei_price(highest_bid, cons_token_name)}`. Note, bids must be multiples of `0.0001`",
+                            ephemeral=True)
+                    else:
+                        current_price = bid_wei
+                else:  ## Auto-calculate adding 5% to the highest bid in a safe way
+                    new_current_price = restrict_to_multiples(safe_to_ether(highest_bid * 1.05, cons_token_name))
+                    logger.info(f"new_current: {new_current_price}")
+                    if (new_current_price > safe_to_ether(current_price, cons_token_name)):
+                        current_price = safe_to_wei(new_current_price, cons_token_name)
+                    else:
+                        current_price = highest_bid + safe_to_wei(0.0001, cons_token_name)
 
             (_, _, os_fee_start_price, _) = get_order_prices(current_price, unit="wei")
             order_params = get_order_parameters(
@@ -640,6 +665,7 @@ async def _buy(ctx, ens_name, bid=None):
 
 
 @slash_command(name="buy", description="Buy ENS name")
+@auto_defer(ephemeral=True)
 @slash_option(
     name="ens_name",
     description="Please provide the ENS name that you wish to buy.",
@@ -650,23 +676,19 @@ async def _buy(ctx, ens_name, bid=None):
 )
 @slash_option(
     name="bid",
-    description="When participating in auctions, you can choose to specify your bid or let it be automatically calculated.",
+    description="In auctions, you can set your bid or let it auto-calculate.",
     required=False,
     opt_type=OptionType.NUMBER,
 )
-async def buy(ctx: SlashContext, ens_name, bid):
+async def buy(ctx: SlashContext, ens_name, bid=None):
     await _buy(ctx, ens_name, bid)
 
 
 @component_callback(re.compile(r"^buy_btn_"))
 async def my_callback(ctx: ComponentContext):
     ens_name = re.sub(r"^buy_btn_", "", ctx.custom_id)
+    await ctx.defer(ephemeral=True)
     await _buy(ctx, ens_name)
-
-
-@slash_command(name="test", description="This command is for testing purposes")
-async def test(ctx: SlashContext):
-    await ctx.send("This is just a test")
 
 
 async def _link_wallet(ctx: SlashContext, ctx_message):
@@ -674,11 +696,12 @@ async def _link_wallet(ctx: SlashContext, ctx_message):
 
     json_data = json.dumps({"username": ctx.author.tag})
 
-    tx_db.add_tx({"tx_key": tx_key,
-                  "user": ctx.author_id,
-                  "action": "link_wallet",
-                  "channel": ctx.channel_id,
-                  "next_action_data": json_data})
+    tx_db.add_tx(
+        {"tx_key": tx_key,
+         "user": ctx.author_id,
+         "action": "link_wallet",
+         "channel": ctx.channel_id,
+         "next_action_data": json_data})
 
     tx = {
         "to": "",
@@ -712,17 +735,19 @@ async def _approve_opensea(ctx: SlashContext, user_address, nft_contract, ens_na
                            end_price, duration_days):
     tx_key = generate_tx_key()
 
-    tx_db.add_tx({"tx_key": tx_key,
-                  "user": ctx.author_id,
-                  "action": "approve_opensea",
-                  "channel": ctx.channel_id,
-                  "next_action_data": json.dumps({"ens_name": ens_name,
-                                                  "user_address": user_address,
-                                                  "start_price": start_price,
-                                                  "end_price": end_price,
-                                                  "duration_days": duration_days,
-                                                  "token_id": token_id,
-                                                  "is_wrapped": is_wrapped})})
+    tx_db.add_tx(
+        {"tx_key": tx_key,
+         "user": ctx.author_id,
+         "action": "approve_opensea",
+         "channel": ctx.channel_id,
+         "next_action_data": json.dumps(
+             {"ens_name": ens_name,
+              "user_address": user_address,
+              "start_price": start_price,
+              "end_price": end_price,
+              "duration_days": duration_days,
+              "token_id": token_id,
+              "is_wrapped": is_wrapped})})
 
     tx_data = nft_contract.encodeABI(fn_name="setApprovalForAll", args=[opensea_conduit.address, True])
 
@@ -739,8 +764,7 @@ async def _approve_opensea(ctx: SlashContext, user_address, nft_contract, ens_na
         title=f"Approve OpenSea to transfer ENS names",
         description=f"This will open your MetaMask...",
         color=BrandColors.GREEN,
-        url=tx_url
-    )
+        url=tx_url)
 
     return await ctx.send(
         "In order to sell this name, you will need to perform the following approval transaction for OpenSea.",
@@ -918,6 +942,7 @@ async def send_bid_sign_url(ctx,
 
 
 @slash_command(name="sell", description="Sell ENS name")
+@auto_defer(ephemeral=True)
 @slash_option(
     name="ens_name",
     description="Please provide the ENS name that you wish to sell.",
@@ -1097,6 +1122,7 @@ async def _owned_names(ctx: SlashContext, owner_address):
 
 
 @slash_command(name="owned_names", description="Shows list of names owned by a given address")
+@auto_defer(ephemeral=True)
 @slash_option(
     name="owner_address",
     description="Please provide the Ethereum address you wish to get list of owned names for.",
@@ -1110,6 +1136,7 @@ async def owned_names(ctx: SlashContext, owner_address):
 
 
 @slash_command(name="my_names", description="Shows list of names owned by your linked wallet address")
+@auto_defer(ephemeral=True)
 async def my_names(ctx: SlashContext):
     try:
         user_address = user_address_db.get_address(ctx.author_id)
@@ -1135,6 +1162,7 @@ async def my_wallet(ctx: SlashContext):
 
 
 @slash_command(name="register", description="Registers ENS name")
+@auto_defer(ephemeral=True)
 @slash_option(
     name="ens_name",
     description="Please provide the ENS name that you wish to register.",
@@ -1343,11 +1371,11 @@ async def bid_callback(tx, tx_signature, next_action_data):
         )
 
         return await channel.send(
-            f"Exciting news! {user.mention} has just placed the highest bid of `{formatted_price} {token_name.upper()}` "
+            f"Exciting news! {user.mention} has just placed the highest bid of `{formatted_price}` "
             f"in the auction for `{ens_name}`! Don't miss out and place your bid before the auction ends "
             f"{format_time_remaining(expiration_datetime)}!", components=components)
     except Exception as e:
-        logger.error(f"Error in buy_callback {str(e)}")
+        logger.error(f"Error in bid_callback {str(e)}")
         raise e
 
 
@@ -1361,7 +1389,7 @@ async def buy_callback(tx, tx_hash, next_action_data):
         ctx_author = tx["user"]
         return await channel.send(
             f"Exciting announcement! `{ens_name}` has been successfully purchased by {mention(ctx_author)} "
-            f"for `{formatted_price} {token_name.upper()}`!")
+            f"for `{formatted_price}`!")
     except Exception as e:
         logger.error(f"Error in buy_callback {str(e)}")
         raise e
@@ -1407,7 +1435,7 @@ async def sell_callback(tx, tx_signature, next_action_data):
         embed = Embed(
             title=f"View `{ens_name}` on OpenSea",
             fields=[
-                {"name": "Price", "value": f"{price} ETH", "inline": True},
+                {"name": "Price", "value": f"{price}", "inline": True},
                 {"name": "Expiration", "value": expiration_date.strftime("%Y-%m-%d"), "inline": True}
             ],
             color=BrandColors.GREEN,
