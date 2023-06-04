@@ -311,6 +311,8 @@ def split_opensea_consideration(wei_value):
 
 
 def restrict_to_multiples(value, multiple=0.0001):
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
     decimal_multiple = Decimal(str(multiple))
     restricted_value = (value / decimal_multiple).quantize(Decimal('0'), rounding=ROUND_DOWN) * decimal_multiple
     return restricted_value
@@ -363,8 +365,35 @@ async def get_eth_usd_price():
         headers={"cache-control": f"max-age={eth_price_cache_expire}"})
 
     response = response.json()
-    logger.info(f"timestamp: {response['result']['ethusd_timestamp']}")
-    return float(response["result"]["ethusd"])
+    return Decimal(response["result"]["ethusd"])
+
+
+def min_usd_worth(amount, min_usd_worth, eth_usd_price, token_name):
+    """
+    Checks if given amount is at least worth `min_usd_worth` in USD terms.
+    Returns tuple, if it's worth and worth amount
+    """
+    if token_name == "usdc" or token_name == "dai":
+        return (amount >= min_usd_worth, amount)
+    elif token_name == "eth" or token_name == "weth":
+        usd_worth = amount * eth_usd_price
+        return (usd_worth >= min_usd_worth, usd_worth)
+    else:
+        return (False, 0)
+
+
+def get_usd_worth_amount(amount, usd_worth, eth_usd_price, token_name):
+    """
+    Calculates amount of token that's worth `usd_worth` in USD
+    """
+    usd_worth = Decimal(str(usd_worth))
+    if token_name == "usdc" or token_name == "dai":
+        return usd_worth
+    elif token_name == "eth" or token_name == "weth":
+        eth_amount = usd_worth / eth_usd_price
+        return eth_amount
+    else:
+        0
 
 
 @listen()
@@ -480,7 +509,8 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
                 fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
                         {"name": "Your Bid", "value": f"{formatted_price}", "inline": True},
                         {"name": "Highest Bid",
-                         "value": format_wei_price(highest_bid, token_name), "inline": True},
+                         "value": "None" if highest_bid == 0 else format_wei_price(highest_bid, token_name),
+                         "inline": True},
                         {"name": "Current Balance",
                          "value": format_wei_price(user_balance, token_name), "inline": True},
                         {"name": "Auction Ends", "value": formatted_expiration}],
@@ -517,10 +547,6 @@ async def _buy(ctx, ens_name, bid=None):
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
 
-        price = await get_eth_usd_price()
-        await ctx.send(f"ETH/USD price is {price}")
-        return
-
         if not is_top_level_eth(cured_name):
             await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
                            ephemeral=True)
@@ -529,9 +555,6 @@ async def _buy(ctx, ens_name, bid=None):
         if user_address is None:
             return await _link_wallet(
                 ctx, "To buy an ENS name, we need your Ethereum address associated with your Discord account.")
-
-        if bid and float(bid) < 0.0001:
-            return await ctx.send(f"Apologies, but minimum bid on OpenSea is 0.0001", ephemeral=True)
 
         name_label = remove_eth_suffix(cured_name)
 
@@ -614,12 +637,22 @@ async def _buy(ctx, ens_name, bid=None):
             response = await http_client.get(url, headers=os_api_headers)
             offers = response.json()
 
+            eth_usd_price = await get_eth_usd_price()
+
             bid_wei = None
             if bid is not None:
                 bid = restrict_to_multiples(Decimal(str(bid)))
+                is_worth, usd_worth = min_usd_worth(bid, 5, eth_usd_price, cons_token_name)
+
+                if not is_worth:  # user specified bid is not 5 USD worth
+                    return await ctx.send(
+                        f"Apologies, but the bid must be worth at least 5 USD per unit. "
+                        f"Got {round(usd_worth, 2)} USD per unit",
+                        ephemeral=True)
+
                 bid_wei = safe_to_wei(bid, cons_token_name)
 
-            if "orders" in offers and len(offers["orders"]) > 0:
+            if "orders" in offers and len(offers["orders"]) > 0:  # Have some bids in the auction
                 highest_bid = int(offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"])
 
                 if bid_wei:
@@ -628,15 +661,24 @@ async def _buy(ctx, ens_name, bid=None):
                             f"Apologies, but your bid is not higher than the current highest bid of "
                             f"`{format_wei_price(highest_bid, cons_token_name)}`. Note, bids must be multiples of `0.0001`",
                             ephemeral=True)
-                    else:
+                    else:  # user specified bid is good to go
                         current_price = bid_wei
                 else:  ## Auto-calculate adding 5% to the highest bid in a safe way
                     new_current_price = restrict_to_multiples(safe_to_ether(highest_bid * 1.05, cons_token_name))
-                    logger.info(f"new_current: {new_current_price}")
-                    if new_current_price > safe_to_ether(current_price, cons_token_name):
+                    current_price = safe_to_wei(new_current_price, cons_token_name)
+            else:  # No bids in the auction
+                if bid_wei:  # use user specified bid that has been checked above
+                    current_price = bid_wei
+                else:  # No bids in the auction and no user specified bid
+                    is_worth, usd_worth = min_usd_worth(  # check if auction start price is 5 USD worth
+                        safe_to_ether(current_price, cons_token_name), 5, eth_usd_price, cons_token_name)
+                    if not is_worth:  # user didn't specify bid and auction start price is less than 5 USD
+                        desired_usd_worth = 5.01
+                        if cons_token_name == "eth" or cons_token_name == "weth":
+                            desired_usd_worth = 5.05  # Add bit of a reserve
+                        new_current_price = get_usd_worth_amount \
+                            (current_price, desired_usd_worth, eth_usd_price, cons_token_name)
                         current_price = safe_to_wei(new_current_price, cons_token_name)
-                    else:
-                        current_price = highest_bid + safe_to_wei(0.0001, cons_token_name)
 
             (_, _, os_fee_start_price, _) = get_order_prices(current_price, unit="wei")
             order_params = get_order_parameters(
