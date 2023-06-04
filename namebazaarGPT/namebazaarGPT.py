@@ -43,6 +43,8 @@ tx_page_url = os.getenv('TX_PAGE_URL')
 server_host = os.getenv('SERVER_HOST')
 server_port = os.getenv('SERVER_PORT')
 tx_check_interval = int(os.getenv('TX_CHECK_INTERVAL'))
+stream_channel_id = int(os.getenv('STREAM_CHANNEL_ID'))
+stream_interval = int(os.getenv('STREAM_INTERVAL'))
 eth_price_cache_expire = 300  # seconds
 
 contract_addresses = {  # Make sure addresses are checksum format
@@ -346,8 +348,8 @@ def format_wei_price(price, token_name="eth"):
     return f"{(round(web3.from_wei(int(price), 'ether'), 4))} {token_name.upper()}"
 
 
-def format_eth_price(price, token_name="eth"):
-    return f"{(round(price, 3))} {token_name.upper()}"
+def format_eth_price(price, token_name="eth", decimals=3):
+    return f"{(round(price, decimals))} {token_name.upper()}"
 
 
 def safe_to_wei(amount, token_name):
@@ -481,11 +483,20 @@ def get_usd_worth_amount(amount, usd_worth, eth_usd_price, token_name):
         0
 
 
+def get_usd_price(amount, eth_usd_price, token_name):
+    if token_name == "usdc" or token_name == "dai":
+        return amount
+    elif token_name == "eth" or token_name == "weth":
+        return amount * eth_usd_price
+    else:
+        0
+
+
 @listen()
 async def on_ready():
     # ready events pass no data, so dont have params
     logger.info("Bot is ready")
-    # await connect_to_stream()
+    await start_stream()
 
 
 async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, price, allowance, token_name,
@@ -787,7 +798,7 @@ async def _buy(ctx, ens_name, bid=None):
 )
 @slash_option(
     name="bid",
-    description="In auctions, you can set your bid or let it auto-calculate.",
+    description="You can optionally make an offer, which will be auto-calculated if left empty for auctions.",
     required=False,
     opt_type=OptionType.NUMBER,
 )
@@ -1451,8 +1462,7 @@ async def bid_callback(tx, tx_signature, next_action_data):
 
         components = Button(
             style=ButtonStyle.GREEN,
-            emoji="🤑",
-            label=f"Place a bid",
+            label=f"Make Offer",
             custom_id=f"buy_btn_{ens_name}",
         )
 
@@ -1532,7 +1542,6 @@ async def sell_callback(tx, tx_signature, next_action_data):
 
         components = Button(
             style=ButtonStyle.GREEN,
-            emoji="🤑",
             label=f"Buy",
             custom_id=f"buy_btn_{ens_name}",
         )
@@ -1617,8 +1626,30 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
         raise e
 
 
-async def connect_to_stream():
-    logger.info("heren")
+async def on_item_received_bid(payload, channel):
+    ens_name = payload["item"]["metadata"]["name"]
+    price = int(payload["base_price"])
+    token_name = payload["payment_token"]["symbol"].lower()
+    eth_usd_price = Decimal(str(payload["payment_token"]["usd_price"]))
+    usd_price = get_usd_price(safe_to_ether(price, token_name), eth_usd_price, token_name)
+    formatted_usd_price = ""
+    if token_name == "eth" or token_name == "weth":
+        formatted_usd_price = f" `({format_eth_price(usd_price, 'usd', decimals=2)})`"
+
+    components = Button(
+        style=ButtonStyle.GREEN,
+        label=f"Make Offer",
+        custom_id=f"buy_btn_{ens_name}",
+    )
+
+    return await channel.send(
+        f"`{ens_name}` has just received a new offer: `{format_wei_price(price, token_name)}`"
+        f"{formatted_usd_price}",
+        components=components)
+
+
+async def start_stream():
+    channel = bot.get_channel(stream_channel_id)
     connection_string = f"wss://stream.openseabeta.com/socket/websocket?token={opensea_api_key}"
     async with websockets.connect(connection_string) as websocket:
         subscription_message = {
@@ -1627,16 +1658,16 @@ async def connect_to_stream():
             "payload": {},
             "ref": 0
         }
-        logger.info("here")
         await websocket.send(json.dumps(subscription_message))
-        logger.info("here2")
 
         while True:
-            logger.info("here3")
             response = await websocket.recv()
-            logger.info("Received message:")
-            logger.info(response)
-            # Add your response processing code here
+            response = json.loads(response)
+            event = response["event"]
+            if event == "item_received_bid":
+                await on_item_received_bid(response["payload"]["payload"], channel)
+            await asyncio.sleep(stream_interval)
+
 
 
 app = Quart(__name__)
