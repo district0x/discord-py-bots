@@ -5,8 +5,7 @@ import json
 import logging
 import os
 import re
-import openai
-import pinecone
+import websockets
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
 from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, File, \
@@ -376,16 +375,94 @@ async def get_eth_usd_price():
     return Decimal(response["result"]["ethusd"])
 
 
+async def get_highest_bid(asset_contract_address, token_id):
+    url = f"{get_opensea_url('offers')}?" \
+          f"asset_contract_address={asset_contract_address}&" \
+          f"token_ids={token_id}&" \
+          f"order_by=eth_price&" \
+          f"order_direction=desc&" \
+          f"limit=1"
+
+    response = await http_client.get(url, headers=os_api_headers)
+    offers = response.json()
+
+    if "orders" in offers and len(offers["orders"]) > 0:  # Have some bids in the auction
+        return int(offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"])
+    return None
+
+
+async def get_cheapest_listing(asset_contract_address, token_id):
+    url = f"{get_opensea_url('listings')}?" \
+          f"asset_contract_address={asset_contract_address}&" \
+          f"token_ids={token_id}&" \
+          f"order_by=eth_price&" \
+          f"order_direction=asc&" \
+          f"limit=1"
+
+    response = await http_client.get(url, headers=os_api_headers)
+
+    listings = response.json()
+
+    if not "orders" in listings or len(listings["orders"]) == 0:
+        return None
+    else:
+        return listings["orders"][0]
+
+
+async def get_fulfillment(order_hash, protocol_address, user_address):
+    url = get_opensea_url("fulfillment")
+
+    payload = {
+        "listing": {
+            "hash": order_hash,
+            "chain": "ethereum",
+            "protocol_address": protocol_address
+        },
+        "fulfiller": {
+            "address": user_address
+        }
+    }
+
+    response = await http_client.post(url, json=payload, headers=os_api_headers)
+    return response.json()
+
+
+def calculate_bid(current_price, bid_wei, highest_bid, token_name, eth_usd_price):
+    if highest_bid:  # Have some bids in the auction
+        if bid_wei:
+            if highest_bid >= bid_wei:
+                return "too_low"
+            else:  # user specified bid is good to go
+                current_price = bid_wei
+        else:  ## Auto-calculate adding 5% to the highest bid in a safe way
+            new_current_price = restrict_to_multiples(safe_to_ether(highest_bid * 1.05, token_name))
+            current_price = safe_to_wei(new_current_price, token_name)
+    else:  # No bids in the auction
+        if bid_wei:  # use user specified bid that has been checked above
+            current_price = bid_wei
+        else:  # No bids in the auction and no user specified bid
+            is_worth, usd_worth = min_usd_worth(  # check if auction start price is 5 USD worth
+                safe_to_ether(current_price, token_name), 5, eth_usd_price, token_name)
+            if not is_worth:  # user didn't specify bid and auction start price is less than 5 USD
+                desired_usd_worth = 5.01
+                if token_name == "eth" or token_name == "weth":
+                    desired_usd_worth = 5.05  # Add bit of a reserve
+                new_current_price = get_usd_worth_amount \
+                    (current_price, desired_usd_worth, eth_usd_price, token_name)
+                current_price = safe_to_wei(new_current_price, token_name)
+    return current_price
+
+
 def min_usd_worth(amount, min_usd_worth, eth_usd_price, token_name):
     """
     Checks if given amount is at least worth `min_usd_worth` in USD terms.
     Returns tuple, if it's worth and worth amount
     """
     if token_name == "usdc" or token_name == "dai":
-        return (amount >= min_usd_worth, amount)
+        return (amount > min_usd_worth, amount)
     elif token_name == "eth" or token_name == "weth":
         usd_worth = amount * eth_usd_price
-        return (usd_worth >= min_usd_worth, usd_worth)
+        return (usd_worth > min_usd_worth, usd_worth)
     else:
         return (False, 0)
 
@@ -408,10 +485,11 @@ def get_usd_worth_amount(amount, usd_worth, eth_usd_price, token_name):
 async def on_ready():
     # ready events pass no data, so dont have params
     logger.info("Bot is ready")
+    # await connect_to_stream()
 
 
 async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, price, allowance, token_name,
-                                  token_contract, next_tx_to, next_tx_data, next_tx_value, next_tx_order_type,
+                                  token_contract, next_tx_to, next_tx_data, next_tx_value, is_bid,
                                   highest_bid, expiration_time):
     try:
         tx_key = generate_tx_key()
@@ -426,11 +504,11 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, pri
                            "highest_bid": highest_bid,
                            "expiration_time": expiration_time,
                            "token_name": token_name,
+                           "is_bid": is_bid,
                            "next_tx_to": next_tx_to,
                            "next_tx_from": user_address,
                            "next_tx_data": next_tx_data,
-                           "next_tx_value": next_tx_value,
-                           "next_tx_order_type": next_tx_order_type})})
+                           "next_tx_value": next_tx_value})})
         tx_data = token_contract.encodeABI(fn_name="approve", args=[opensea_conduit.address, price])
 
         tx = {
@@ -473,7 +551,7 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, pri
 
 
 async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_data, tx_value, ctx_author_id,
-                          ctx_channel_id, order_type, expiration_time, highest_bid):
+                          ctx_channel_id, expiration_time, highest_bid, is_bid):
     try:
         seaport = web3.eth.contract(address=tx_to, abi=seaport_abi)
 
@@ -484,54 +562,52 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
             "value": tx_value
         }
         tx_key = generate_tx_key()
-        tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if order_type == "english" else None)
+        tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if is_bid else None)
         formatted_price = format_wei_price(price, token_name)
         expiration_datetime = datetime.fromtimestamp(expiration_time)
         formatted_expiration = format_datetime(expiration_datetime)
 
-        logger.info(f"order_type: {order_type}")
-
         tx_db.add_tx(
             {"tx_key": tx_key,
              "user": ctx_author_id,
-             "action": "bid" if order_type == "english" else "buy",
+             "action": "bid" if is_bid else "buy",
              "channel": ctx_channel_id,
              "next_action_data": json.dumps(
                  {"ens_name": ens_name,
                   "formatted_price": formatted_price,
                   "token_name": token_name,
-                  "order_type": order_type,
                   "expiration_time": expiration_time,
-                  "order_params": tx_data if order_type == "english" else ""})})
+                  "order_params": tx_data if is_bid else ""})})
 
+        logger.info("here4")
         _, token_contract = get_token_contract(get_token_address(token_name))
         if token_contract is None:
             user_balance = web3.eth.get_balance(tx_from)
         else:
             user_balance = token_contract.functions.balanceOf(tx_from).call()
 
-        if order_type == "english":
+        if is_bid:
             embed = Embed(
-                title=f"Place a `{formatted_price}` bid in the {ens_name} auction",
-                description=f"In order to place a bid in the `{ens_name}` auction, {tx_link_instruction_text}",
+                title=f"Make `{formatted_price}` offer for the {ens_name}",
+                description=f"In order to make an offer for the `{ens_name}`, {tx_link_instruction_text}",
                 fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
-                        {"name": "Your Bid", "value": f"{formatted_price}", "inline": True},
-                        {"name": "Highest Bid",
-                         "value": "None" if highest_bid == 0 else format_wei_price(highest_bid, token_name),
+                        {"name": "Your Offer", "value": f"{formatted_price}", "inline": True},
+                        {"name": "Highest Offer",
+                         "value": "None" if highest_bid is None else format_wei_price(highest_bid, token_name),
                          "inline": True},
                         {"name": "Current Balance",
                          "value": format_wei_price(user_balance, token_name), "inline": True},
-                        {"name": "Auction Ends", "value": formatted_expiration}],
+                        {"name": "Expiration", "value": formatted_expiration}],
                 color=BrandColors.GREEN,
                 url=tx_url)
             return await ctx.send(
-                f"`{ens_name}` is currently in an auction! Place your bid before it ends "
+                f"Get ready to make an offer for `{ens_name}`! Don't wait too long, as it's ending "
                 f"{format_time_remaining(expiration_datetime)}!",
                 embeds=embed, ephemeral=True)
         else:
             embed = Embed(
                 title=f"Buy `{ens_name}`",
-                description=f"In order to buy `{ens_name}`, {tx_link_instruction_text}",
+                description=f"In order to purchase `{ens_name}`, {tx_link_instruction_text}",
                 fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
                         {"name": "Price", "value": f"{formatted_price}", "inline": True},
                         {"name": "Current Balance",
@@ -540,7 +616,9 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
                         {"name": "Offer Ends", "value": formatted_expiration, "inline": True}],
                 color=BrandColors.GREEN,
                 url=tx_url)
-            return await ctx.send(f"You're about to own `{ens_name}`!", embeds=embed, ephemeral=True)
+            return await ctx.send(f"Lucky day! `{ens_name}` can be purchased instantly! Don't wait too long, "
+                                  f"as it's ending {format_time_remaining(expiration_datetime)}!",
+                                  embeds=embed, ephemeral=True)
 
 
     except Exception as e:
@@ -573,120 +651,62 @@ async def _buy(ctx, ens_name, bid=None):
         is_wrapped = name_wrapper.functions.isWrapped(node).call()
         asset_contract_address = name_wrapper.address if is_wrapped else eth_registrar.address
         token_id = wrapped_token_id if is_wrapped else unwrapped_token_id
+        eth_usd_price = await get_eth_usd_price()
+        bid_wei = None
 
-        url = f"{get_opensea_url('listings')}?" \
-              f"asset_contract_address={asset_contract_address}&" \
-              f"token_ids={token_id}&" \
-              f"order_by=eth_price&" \
-              f"order_direction=asc&" \
-              f"limit=1"
+        cheapest_listing = await get_cheapest_listing(asset_contract_address, token_id)
 
-        response = await http_client.get(url, headers=os_api_headers)
-
-        listings = response.json()
-
-        if not "orders" in listings or len(listings["orders"]) == 0:
+        if not cheapest_listing:
             return await ctx.send(f"It appears that `{cured_name}` is not currently listed for sale on OpenSea.",
                                   ephemeral=True)
 
-        # logger.info(listings)
+        order_hash = cheapest_listing["order_hash"]
+        protocol_address = cheapest_listing["protocol_address"]
+        current_price = int(cheapest_listing["current_price"])
+        order_type = cheapest_listing["order_type"]
+        cons_token = cheapest_listing["protocol_data"]["parameters"]["consideration"][0]["token"]
+        offerer = cheapest_listing["protocol_data"]["parameters"]["offerer"]
+        expiration_time = cheapest_listing["expiration_time"]
+        cons_token_name, cons_token_contract = get_token_contract(cons_token)
+        highest_bid = None
 
-        cheapest_order = listings["orders"][0]
-        order_hash = cheapest_order["order_hash"]
-        protocol_address = cheapest_order["protocol_address"]
-        current_price = int(cheapest_order["current_price"])
-        order_type = cheapest_order["order_type"]
-        cons_token = cheapest_order["protocol_data"]["parameters"]["consideration"][0]["token"]
-        expiration_time = cheapest_order["expiration_time"]
+        if user_address.lower() == offerer.lower():
+            return await ctx.send(f"It seems that your linked Ethereum address has listed `{cured_name}` on OpenSea.",
+                                  ephemeral=True)
 
-        url = get_opensea_url("fulfillment")
+        if bid is None:
+            fulfillment = await get_fulfillment(order_hash, protocol_address, user_address)
+            fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
+            fn_name = fn_signature.split("(")[0]
+            tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
+        else:
+            bid = restrict_to_multiples(Decimal(str(bid)))
+            is_worth, usd_worth = min_usd_worth(bid, 5, eth_usd_price, cons_token_name)
 
-        payload = {
-            "listing": {
-                "hash": order_hash,
-                "chain": "ethereum",
-                "protocol_address": protocol_address
-            },
-            "fulfiller": {
-                "address": user_address
-            }
-        }
+            if not is_worth:  # user specified bid is not 5 USD worth
+                return await ctx.send(
+                    f"Apologies, but the bid must be worth more than 5 USD per unit. "
+                    f"Got {round(usd_worth, 2)} USD per unit", ephemeral=True)
+            bid_wei = safe_to_wei(bid, cons_token_name)
 
-        response = await http_client.post(url, json=payload, headers=os_api_headers)
-        fulfillment = response.json()
-
-        # logger.info("----------------------------------------")
-        # logger.info(fulfillment)
-
-        tx_to = Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])
-        fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
-        fn_name = fn_signature.split("(")[0]
-        tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
-        highest_bid = 0
-        (cons_token_name, cons_token_contract) = get_token_contract(cons_token)
-
-        if order_type == "basic":
+        if not bid_wei and order_type == "basic":
             parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
             args = prepare_tx_args(parameters)
             tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(args)])
-        elif order_type == "dutch":
+        elif not bid_wei and order_type == "dutch":
             order = fulfillment["fulfillment_data"]["transaction"]["input_data"]["order"]
             fulfiller_conduit_key = fulfillment["fulfillment_data"]["transaction"]["input_data"]["fulfillerConduitKey"]
             order_args = prepare_tx_args(order)
             tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(order_args), fulfiller_conduit_key])
-        elif order_type == "english":
-            url = f"{get_opensea_url('offers')}?" \
-                  f"asset_contract_address={asset_contract_address}&" \
-                  f"token_ids={token_id}&" \
-                  f"order_by=eth_price&" \
-                  f"order_direction=desc&" \
-                  f"limit=1"
+        elif bid_wei or order_type == "english":
+            highest_bid = await get_highest_bid(asset_contract_address, token_id)
+            current_price = calculate_bid(current_price, bid_wei, highest_bid, cons_token_name, eth_usd_price)
 
-            response = await http_client.get(url, headers=os_api_headers)
-            offers = response.json()
-
-            eth_usd_price = await get_eth_usd_price()
-
-            bid_wei = None
-            if bid is not None:
-                bid = restrict_to_multiples(Decimal(str(bid)))
-                is_worth, usd_worth = min_usd_worth(bid, 5, eth_usd_price, cons_token_name)
-
-                if not is_worth:  # user specified bid is not 5 USD worth
-                    return await ctx.send(
-                        f"Apologies, but the bid must be worth at least 5 USD per unit. "
-                        f"Got {round(usd_worth, 2)} USD per unit",
-                        ephemeral=True)
-
-                bid_wei = safe_to_wei(bid, cons_token_name)
-
-            if "orders" in offers and len(offers["orders"]) > 0:  # Have some bids in the auction
-                highest_bid = int(offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"])
-
-                if bid_wei:
-                    if highest_bid >= bid_wei:
-                        return await ctx.send(
-                            f"Apologies, but your bid is not higher than the current highest bid of "
-                            f"`{format_wei_price(highest_bid, cons_token_name)}`. Note, bids must be multiples of `0.0001`",
-                            ephemeral=True)
-                    else:  # user specified bid is good to go
-                        current_price = bid_wei
-                else:  ## Auto-calculate adding 5% to the highest bid in a safe way
-                    new_current_price = restrict_to_multiples(safe_to_ether(highest_bid * 1.05, cons_token_name))
-                    current_price = safe_to_wei(new_current_price, cons_token_name)
-            else:  # No bids in the auction
-                if bid_wei:  # use user specified bid that has been checked above
-                    current_price = bid_wei
-                else:  # No bids in the auction and no user specified bid
-                    is_worth, usd_worth = min_usd_worth(  # check if auction start price is 5 USD worth
-                        safe_to_ether(current_price, cons_token_name), 5, eth_usd_price, cons_token_name)
-                    if not is_worth:  # user didn't specify bid and auction start price is less than 5 USD
-                        desired_usd_worth = 5.01
-                        if cons_token_name == "eth" or cons_token_name == "weth":
-                            desired_usd_worth = 5.05  # Add bit of a reserve
-                        new_current_price = get_usd_worth_amount \
-                            (current_price, desired_usd_worth, eth_usd_price, cons_token_name)
-                        current_price = safe_to_wei(new_current_price, cons_token_name)
+            if current_price == "too_low":
+                return await ctx.send(
+                    f"Apologies, but your bid is not higher than the current highest bid of "
+                    f"`{format_wei_price(highest_bid, cons_token_name)}`.",
+                    ephemeral=True)
 
             (_, _, os_fee_start_price, _) = get_order_prices(current_price, unit="wei")
             order_params = get_order_parameters(
@@ -710,6 +730,7 @@ async def _buy(ctx, ens_name, bid=None):
                 end_time=int(expiration_time) + 604800,  # + 1 week
                 order_type=0)
             tx_data = json.dumps(order_params)
+            tx_value = 0
 
         if cons_token_name != "eth":
             allowance = int(cons_token_contract.functions.allowance(user_address, opensea_conduit.address).call())
@@ -725,20 +746,20 @@ async def _buy(ctx, ens_name, bid=None):
                     token_contract=cons_token_contract,
                     expiration_time=expiration_time,
                     highest_bid=highest_bid,
-                    next_tx_to=tx_to,
+                    is_bid=True if bid else False,
+                    next_tx_to=seaport.address,
                     next_tx_data=tx_data,
-                    next_tx_value=tx_value,
-                    next_tx_order_type=order_type)
+                    next_tx_value=tx_value)
 
         return await send_buy_tx_url(
             ctx=ctx,
             ens_name=cured_name,
             price=current_price,
-            tx_to=tx_to,
-            order_type=order_type,
+            is_bid=True if bid else False,
             token_name=cons_token_name,
             expiration_time=expiration_time,
             highest_bid=highest_bid,
+            tx_to=seaport.address,
             tx_from=user_address,
             tx_data=tx_data,
             tx_value=tx_value,
@@ -1437,7 +1458,7 @@ async def bid_callback(tx, tx_signature, next_action_data):
 
         return await channel.send(
             f"Exciting news! {user.mention} has just placed the highest bid of `{formatted_price}` "
-            f"in the auction for `{ens_name}`! Don't miss out and place your bid before the auction ends "
+            f"for the name `{ens_name}`! Don't miss out and place your bid before the offer ends "
             f"{format_time_remaining(expiration_datetime)}!", components=components)
     except Exception as e:
         logger.error(f"Error in bid_callback {str(e)}")
@@ -1512,7 +1533,7 @@ async def sell_callback(tx, tx_signature, next_action_data):
         components = Button(
             style=ButtonStyle.GREEN,
             emoji="🤑",
-            label=f"Buy {ens_name}",
+            label=f"Buy",
             custom_id=f"buy_btn_{ens_name}",
         )
 
@@ -1586,7 +1607,7 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
             tx_from=next_action_data["next_tx_from"],
             tx_data=next_action_data["next_tx_data"],
             tx_value=next_action_data["next_tx_value"],
-            tx_order_type=next_action_data["next_tx_order_type"],
+            is_bid=next_action_data["is_bid"],
             highest_bid=next_action_data["highest_bid"],
             expiration_time=next_action_data["expiration_time"],
             ctx_author_id=tx["user"],
@@ -1594,6 +1615,28 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
     except Exception as e:
         logger.error(f"Error in approve_erc20_allowance_callback {str(e)}")
         raise e
+
+
+async def connect_to_stream():
+    logger.info("heren")
+    connection_string = f"wss://stream.openseabeta.com/socket/websocket?token={opensea_api_key}"
+    async with websockets.connect(connection_string) as websocket:
+        subscription_message = {
+            "topic": f"collection:ens",
+            "event": "phx_join",
+            "payload": {},
+            "ref": 0
+        }
+        logger.info("here")
+        await websocket.send(json.dumps(subscription_message))
+        logger.info("here2")
+
+        while True:
+            logger.info("here3")
+            response = await websocket.recv()
+            logger.info("Received message:")
+            logger.info(response)
+            # Add your response processing code here
 
 
 app = Quart(__name__)
