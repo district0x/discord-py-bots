@@ -267,6 +267,10 @@ def prepare_tx_args(data):
         return data
 
 
+def format_datetime(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 format_time_remaining_units = [
     {'name': 'second', 'limit': 60, 'in_seconds': 1},
     {'name': 'minute', 'limit': 60 * 60, 'in_seconds': 60},
@@ -341,6 +345,10 @@ def format_wei_price(price, token_name="eth"):
     if token_name == "usdc":
         return f"{(round(int(price) / 1000000, 3))} {token_name.upper()}"
     return f"{(round(web3.from_wei(int(price), 'ether'), 4))} {token_name.upper()}"
+
+
+def format_eth_price(price, token_name="eth"):
+    return f"{(round(price, 3))} {token_name.upper()}"
 
 
 def safe_to_wei(amount, token_name):
@@ -479,7 +487,7 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
         tx_url = get_tx_page_url(tx_key, tx, sign_spec="OrderComponents" if order_type == "english" else None)
         formatted_price = format_wei_price(price, token_name)
         expiration_datetime = datetime.fromtimestamp(expiration_time)
-        formatted_expiration = expiration_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        formatted_expiration = format_datetime(expiration_datetime)
 
         logger.info(f"order_type: {order_type}")
 
@@ -970,9 +978,17 @@ async def send_sell_sign_url(ctx, token_id, ens_name, user_address, is_wrapped, 
          "channel": ctx_channel_id,
          "next_action_data": order_params_json})
 
+    expiration_datetime = datetime.fromtimestamp(end_time)
+
     embed = Embed(
         title=f"Sign the sales contract for `{ens_name}`",
         description=f"To initiate the selling process for `{ens_name}`, {tx_link_instruction_text}",
+        fields=[{"name": "ENS Name", "value": ens_name, "inline": True},
+                {"name": "Start Price", "value": format_eth_price(start_price, currency), "inline": True},
+                {"name": "End Price", "value": format_eth_price(end_price, currency), "inline": True},
+                {"name": "OpenSea Fee", "value": "2.5%", "inline": True},
+                {"name": "Duration", "value": f"{duration_days} days", "inline": True},
+                {"name": "Expiration", "value": format_datetime(expiration_datetime), "inline": True}],
         color=BrandColors.GREEN,
         url=tx_url)
 
@@ -1484,7 +1500,7 @@ async def sell_callback(tx, tx_signature, next_action_data):
             title=f"View `{ens_name}` on OpenSea",
             fields=[
                 {"name": "Price", "value": f"{price}", "inline": True},
-                {"name": "Expiration", "value": expiration_date.strftime("%Y-%m-%d"), "inline": True}
+                {"name": "Expiration", "value": format_datetime(expiration_date), "inline": True}
             ],
             color=BrandColors.GREEN,
             url=f"https://opensea.io/assets/ethereum/{contract_address}/{token_id}"
