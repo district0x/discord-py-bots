@@ -1689,27 +1689,61 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
         raise e
 
 
+def get_payload_basic_info(payload):
+    item_name = payload.get("item", {}).get("metadata", {}).get("name", "")
+    permalink = payload.get("item", {}).get("permalink", "")
+    image_url = payload.get("item", {}).get("metadata", {}).get("image_url", "")
+    token_symbol = payload.get("payment_token", {}).get("symbol", "").lower()
+    maker = payload.get("maker", {}).get("address", "")
+    return item_name, permalink, image_url, token_symbol, maker
+
+
 async def on_item_received_bid(payload, channel):
-    ens_name = payload["item"]["metadata"]["name"]
-    asset_url = payload["item"]["permalink"]
-    image_url = payload["item"]["metadata"]["image_url"]
-    price = int(payload["base_price"])
-    offerer = payload["maker"]["address"]
-    token_name = payload["payment_token"]["symbol"].lower()
-    eth_usd_price = Decimal(str(payload["payment_token"]["usd_price"]))
-    usd_price = get_usd_price(safe_to_ether(price, token_name), eth_usd_price, token_name)
-    formatted_usd_price = ""
+    ens_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+
+    if re.search(r"\b\d{3,100}\.eth\b", ens_name):
+        return
+
+    price = int(payload.get("base_price", 0))
     new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
-    # if token_name == "eth" or token_name == "weth":
-    #     formatted_usd_price = f" ({format_eth_price(usd_price, 'usd', decimals=2)})"
 
     embed = Embed(
         title=f"{ens_name} has just received an offer",
         fields=[{"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
                 {"name": "Offerer",
-                 "value": f"[{truncate_string(offerer, 14)}]({get_os_user_url(offerer)})",
+                 "value": f"[{truncate_string(maker, 14)}]({get_os_user_url(maker)})",
                  "inline": True},
                 {"name": "Offer",
+                 "value": f"{format_wei_price(price, token_name)}",
+                 "inline": True}],
+        thumbnail=image_url,
+        color=BrandColors.GREEN)
+
+    components = Button(
+        style=ButtonStyle.GREEN,
+        label=f"Make Better Offer",
+        emoji="☝",
+        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{ens_name}")
+
+    return await channel.send("", embeds=embed, components=components)
+
+
+async def on_item_sold(payload, channel):
+    ens_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+    taker = payload.get("taker", {}).get("address", "")
+    price = int(payload.get("sale_price", 0))
+    new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
+
+    embed = Embed(
+        title=f"{ens_name} has just been sold",
+        fields=[{"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
+                {"name": "Offerer",
+                 "value": f"[{truncate_string(maker, 14)}]({get_os_user_url(maker)})",
+                 "inline": True},
+                {"name": "Buyer",
+                 "value": f"[{truncate_string(taker, 14)}]({get_os_user_url(taker)})",
+                 "inline": True},
+                {"name": "Price",
                  "value": f"{format_wei_price(price, token_name)}",
                  "inline": True}],
         thumbnail=image_url,
@@ -1740,8 +1774,11 @@ async def start_stream():
             response = await websocket.recv()
             response = json.loads(response)
             event = response["event"]
+            payload = response.get("payload", {}).get("payload", {})
             if event == "item_received_bid":
-                await on_item_received_bid(response["payload"]["payload"], channel)
+                await on_item_received_bid(payload, channel)
+            if event == "item_sold":
+                await on_item_sold(payload, channel)
             await asyncio.sleep(stream_interval)
 
 
