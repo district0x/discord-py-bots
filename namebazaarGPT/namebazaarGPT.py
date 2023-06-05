@@ -1701,6 +1701,9 @@ def get_payload_basic_info(payload):
 async def on_item_received_bid(payload, channel):
     ens_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
 
+    if not ens_name:
+        return
+
     if re.search(r"\b\d{3,100}\.eth\b", ens_name):
         return
 
