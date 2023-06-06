@@ -142,6 +142,9 @@ def is_top_level_eth(ens_name):
     if len(parts) == 2 and parts[1] == "eth":
         return True
 
+    if len(parts) == 3 and parts[1] == "eth⚠" and parts[2] == "eth":
+        return True
+
     return False
 
 
@@ -401,10 +404,9 @@ async def get_highest_bid(asset_contract_address, token_id):
     offers = response.json()
 
     if "orders" in offers and len(offers["orders"]) > 0:  # Have some bids in the auction
-        logger.info(offers["orders"][0]["protocol_data"]["parameters"])
         offer = offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]
         return int(offer["startAmount"]), offer["token"]
-    return None
+    return (None, None)
 
 
 async def get_cheapest_listing(asset_contract_address, token_id):
@@ -668,6 +670,7 @@ async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
     try:
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
+        cured_name = re.sub(r"\.\w+⚠", "", cured_name) ## OpenSea Emoji names contain this for some reason
 
         if not is_top_level_eth(cured_name):
             await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
@@ -890,14 +893,12 @@ async def buy_btn_callback(ctx: ComponentContext):
 
 @component_callback(re.compile(r"^offer_btn_"))
 async def offer_btn_callback(ctx: ComponentContext):
-    pattern = r"offer_btn_([\d.]+)_(\w{3,4})_(\w+-\w+\.eth)"
-    match = re.match(pattern, ctx.custom_id)
+    ens_name = re.sub(r"^offer_btn_([\d.]+)_(\w{3,4})_", "", ctx.custom_id)
+    match = re.match(r"offer_btn_([\d.]+)_(\w{3,4})_", ctx.custom_id)
 
     if match:
         price = match.group(1)
         token_name = match.group(2)
-        ens_name = match.group(3)
-        logger.info(price)
         await ctx.defer(ephemeral=True)
         await _buy(ctx, ens_name, price, token_name, force_bid=True)
     else:
@@ -1458,7 +1459,7 @@ async def register(ctx: SlashContext, ens_name):
         await ctx.send(f"I apologize, but the name `{ens_name}` cannot be accepted for registration.", ephemeral=True)
     except Exception as e:
         # Handle the exception here
-        logger.info(f"REGISTER EXCEPTION {str(e)}")
+        logger.error(f"error in register {str(e)}")
         await ctx.respond('An error occurred: {}'.format(str(e)))
         raise e
 
@@ -1507,7 +1508,7 @@ async def send_register_finish_url(
             fields=[
                 {"name": "ENS Name", "value": ens_name, "inline": True},
                 {"name": "Registration length", "value": "1 year", "inline": True},
-                {"name": "Price", "value": f"{format_wei_price(rent_price_wei)} ETH", "inline": True}],
+                {"name": "Price", "value": format_wei_price(rent_price_wei), "inline": True}],
             color=BrandColors.GREEN,
             url=tx_url
         )
@@ -1913,7 +1914,6 @@ app = cors(app, allow_origin="*")  # reconsider this in prod
 async def user_post():
     data = await request.data
     json_data = json.loads(data.decode())
-    logger.info(f'Received POST data: {json_data}')
     tx_key = json_data["txKey"]
     tx_result = json_data["txResult"]
 
