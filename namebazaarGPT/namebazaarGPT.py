@@ -185,6 +185,11 @@ def generate_tx_key():
     return hashlib.sha256(f"{random.randint(10, 999999999999999)}".encode()).hexdigest()[:32]
 
 
+def with_probability(percentage):
+    rand_num = random.randint(0, 1000)
+    return rand_num <= percentage
+
+
 def namehash(name):
     if name == '':
         return b'\0' * 32
@@ -396,7 +401,9 @@ async def get_highest_bid(asset_contract_address, token_id):
     offers = response.json()
 
     if "orders" in offers and len(offers["orders"]) > 0:  # Have some bids in the auction
-        return int(offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]["startAmount"])
+        logger.info(offers["orders"][0]["protocol_data"]["parameters"])
+        offer = offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]
+        return int(offer["startAmount"]), offer["token"]
     return None
 
 
@@ -444,9 +451,13 @@ def get_os_user_url(address):
     return f"https://opensea.io/{address}"
 
 
-def calculate_bid(current_price, bid_wei, highest_bid, token_name, eth_usd_price):
+def format_os_user_url(address):
+    return f"[{truncate_string(address, 10)}]({get_os_user_url(address)})"
+
+
+def calculate_bid(current_price, bid_wei, highest_bid, token_name, eth_usd_price, force_highest_bid=False):
     if highest_bid:  # Have some bids in the auction
-        if bid_wei:
+        if bid_wei and not force_highest_bid:
             if highest_bid >= bid_wei:
                 return "too_low"
             else:  # user specified bid is good to go
@@ -463,10 +474,9 @@ def calculate_bid(current_price, bid_wei, highest_bid, token_name, eth_usd_price
             if not is_worth:  # user didn't specify bid and auction start price is less than 5 USD
                 desired_usd_worth = 5.01
                 if token_name == "eth" or token_name == "weth":
-                    desired_usd_worth = 5.05  # Add bit of a reserve
-                new_current_price = get_usd_worth_amount \
-                    (current_price, desired_usd_worth, eth_usd_price, token_name)
-                current_price = safe_to_wei(new_current_price, token_name)
+                    desired_usd_worth = 5.1  # Add bit of a reserve
+                new_current_price = get_usd_worth_amount(desired_usd_worth, eth_usd_price, token_name)
+                current_price = safe_to_wei(restrict_to_multiples(new_current_price), token_name)
     return current_price
 
 
@@ -484,7 +494,7 @@ def min_usd_worth(amount, min_usd_worth, eth_usd_price, token_name):
         return (False, 0)
 
 
-def get_usd_worth_amount(amount, usd_worth, eth_usd_price, token_name):
+def get_usd_worth_amount(usd_worth, eth_usd_price, token_name):
     """
     Calculates amount of token that's worth `usd_worth` in USD
     """
@@ -654,7 +664,7 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
         raise e
 
 
-async def _buy(ctx, ens_name, bid=None, currency=None):
+async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
     try:
         ens_name = add_eth_suffix(ens_name)
         cured_name = ens_cure(ens_name)
@@ -685,10 +695,25 @@ async def _buy(ctx, ens_name, bid=None, currency=None):
         cheapest_listing = await get_cheapest_listing(asset_contract_address, token_id)
 
         if (not bid or not currency) and not cheapest_listing:
+            highest_bid, highest_bid_token = await get_highest_bid(asset_contract_address, token_id)
+            highest_bid_token_name, _ = get_token_contract(highest_bid_token)
+            if highest_bid:
+                highest_bid_msg = f"Current highest bid is `{format_wei_price(highest_bid, highest_bid_token_name)}`."
+            else:
+                highest_bid_msg = "Currently there are no other offers for this name."
+
+            components = None
+            if highest_bid:
+                components = Button(
+                    style=ButtonStyle.GRAY,
+                    label=f"Make Better Offer",
+                    emoji="☝",
+                    custom_id=f"offer_btn_0_{highest_bid_token_name}_{ens_name}")
+
             return await ctx.send(f"It appears that `{cured_name}` is not currently listed for sale on OpenSea. "
                                   f"You can still make an offer for this name by specifying `bid` and `currency` "
-                                  f"parameters.",
-                                  ephemeral=True)
+                                  f"parameters. {highest_bid_msg}",
+                                  ephemeral=True, components=components)
 
         if currency:
             cons_token = get_token_address(currency)
@@ -716,6 +741,10 @@ async def _buy(ctx, ens_name, bid=None, currency=None):
             order_hash = cheapest_listing["order_hash"]
             protocol_address = cheapest_listing["protocol_address"]
             fulfillment = await get_fulfillment(order_hash, protocol_address, user_address)
+            if not "fulfillment_data" in fulfillment:
+                return await ctx.send(
+                    f"It seems like OpenSea is still preparing this name, please try again in a few seconds",
+                    ephemeral=True)
             fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
             fn_name = fn_signature.split("(")[0]
             tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
@@ -724,10 +753,14 @@ async def _buy(ctx, ens_name, bid=None, currency=None):
             is_worth, usd_worth = min_usd_worth(bid, 5, eth_usd_price, cons_token_name)
 
             if not is_worth:  # user specified bid is not 5 USD worth
-                return await ctx.send(
-                    f"Apologies, but the bid must be worth more than 5 USD per unit. "
-                    f"Got {round(usd_worth, 2)} USD per unit", ephemeral=True)
-            bid_wei = safe_to_wei(bid, cons_token_name)
+                if force_bid:
+                    bid_wei = calculate_bid(0, None, None, cons_token_name, eth_usd_price)
+                else:
+                    return await ctx.send(
+                        f"Apologies, but the bid must be worth more than 5 USD per unit. "
+                        f"Got {round(usd_worth, 2)} USD per unit", ephemeral=True)
+            else:
+                bid_wei = safe_to_wei(bid, cons_token_name)
 
         if not bid_wei and order_type == "basic":
             parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
@@ -740,8 +773,9 @@ async def _buy(ctx, ens_name, bid=None, currency=None):
             tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(order_args), fulfiller_conduit_key])
         elif bid_wei or order_type == "english":
             is_bid = True
-            highest_bid = await get_highest_bid(asset_contract_address, token_id)
-            current_price = calculate_bid(current_price, bid_wei, highest_bid, cons_token_name, eth_usd_price)
+            highest_bid, _ = await get_highest_bid(asset_contract_address, token_id)
+            current_price = calculate_bid(current_price, bid_wei, highest_bid, cons_token_name, eth_usd_price,
+                                          force_highest_bid=force_bid)
 
             if current_price == "too_low":
                 return await ctx.send(
@@ -818,7 +852,7 @@ async def _buy(ctx, ens_name, bid=None, currency=None):
         raise e
 
 
-@slash_command(name="buy", description="Buy ENS name")
+@slash_command(name="buy", description="Buy ENS name from OpenSea")
 @auto_defer(ephemeral=True)
 @slash_option(
     name="ens_name",
@@ -856,7 +890,7 @@ async def buy_btn_callback(ctx: ComponentContext):
 
 @component_callback(re.compile(r"^offer_btn_"))
 async def offer_btn_callback(ctx: ComponentContext):
-    pattern = r"offer_btn_([\d.]+)_(\w+)_(\w+)"
+    pattern = r"offer_btn_([\d.]+)_(\w{3,4})_(\w+-\w+\.eth)"
     match = re.match(pattern, ctx.custom_id)
 
     if match:
@@ -865,7 +899,7 @@ async def offer_btn_callback(ctx: ComponentContext):
         ens_name = match.group(3)
         logger.info(price)
         await ctx.defer(ephemeral=True)
-        await _buy(ctx, ens_name, price, token_name)
+        await _buy(ctx, ens_name, price, token_name, force_bid=True)
     else:
         await ctx.send("Sorry, there's a problem with this action", ephemeral=True)
 
@@ -1086,7 +1120,7 @@ async def send_sell_sign_url(ctx, token_id, ens_name, user_address, is_wrapped, 
     return await ctx.send(ctx_message, embeds=embed, ephemeral=True)
 
 
-@slash_command(name="sell", description="Sell ENS name")
+@slash_command(name="sell", description="Sell your ENS name on OpenSea")
 @auto_defer(ephemeral=True)
 @slash_option(
     name="ens_name",
@@ -1225,7 +1259,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
         raise e
 
 
-async def _owned_names(ctx: SlashContext, owner_address):
+async def _owned_names(ctx: SlashContext, owner_address, flex=False):
     try:
         query_template = """
         {
@@ -1263,7 +1297,13 @@ async def _owned_names(ctx: SlashContext, owner_address):
                 unique_sorted_names = sorted(list(set(combined_names)))
 
                 formatted_names = "\n".join(unique_sorted_names)
-                return await ctx.send(f"```\n{formatted_names}```", ephemeral=True)
+
+                if flex:
+                    flex_msg = f"Let's take a moment to admire the dazzling collection of ENS names owned by " \
+                               f"{mention(ctx.author_id)}!\nWhat an incredible accomplishment! 💪💪💪\n"
+                    return await ctx.send(f"{flex_msg}```\n{formatted_names}```")
+                else:
+                    return await ctx.send(f"```\n{formatted_names}```", ephemeral=True)
             else:
                 return await ctx.send("Apologies, but no matching account was found for this address", ephemeral=True)
         else:
@@ -1302,6 +1342,22 @@ async def my_names(ctx: SlashContext):
             await _owned_names(ctx, user_address)
     except Exception as e:
         logger.error(f"my_names {str(e)}")
+        await ctx.respond('An error occurred: {}'.format(str(e)))
+        raise e
+
+
+@slash_command(name="flex", description="Publicly display a list of the names you own. Show off your collection!")
+@auto_defer(ephemeral=False)
+async def flex(ctx: SlashContext):
+    try:
+        user_address = user_address_db.get_address(ctx.author_id)
+        if user_address is None:
+            return await _link_wallet(ctx,
+                                      "To display your owned ENS names, it requires your Ethereum address linked to your Discord account.")
+        else:
+            return await _owned_names(ctx, user_address, flex=True)
+    except Exception as e:
+        logger.error(f"flex {str(e)}")
         await ctx.respond('An error occurred: {}'.format(str(e)))
         raise e
 
@@ -1486,8 +1542,17 @@ async def register_callback(tx, tx_hash, next_action_data):
     try:
         await wait_for_receipt(tx_hash)
         channel = bot.get_channel(int(tx["channel"]))
+        ens_name = next_action_data['ens_name']
+
+        components = Button(
+            style=ButtonStyle.GRAY,
+            label=f"Make First Offer",
+            emoji="☝",
+            custom_id=f"offer_btn_0_weth_{ens_name}")
+
         await channel.send(
-            f"Great news! `{next_action_data['ens_name']}` is now owned by {mention(tx['user'])}, who can now proudly call it their own!")
+            f"Great news! `{ens_name}` is now owned by {mention(tx['user'])}"
+            f", who can now proudly call it their own!", components=components)
     except Exception as e:
         logger.error(f"Error in register_callback {str(e)}")
         raise e
@@ -1521,10 +1586,10 @@ async def bid_callback(tx, tx_signature, next_action_data):
         expiration_datetime = datetime.fromtimestamp(next_action_data["expiration_time"])
 
         components = Button(
-            style=ButtonStyle.GREEN,
+            style=ButtonStyle.GRAY,
             label=f"Make Better Offer",
             emoji="☝",
-            custom_id=f"buy_btn_{ens_name}",
+            custom_id=f"offer_btn_0_weth_{ens_name}",
         )
 
         return await channel.send(
@@ -1544,9 +1609,16 @@ async def buy_callback(tx, tx_hash, next_action_data):
         formatted_price = next_action_data["formatted_price"]
         token_name = next_action_data["token_name"]
         ctx_author = tx["user"]
+
+        components = Button(
+            style=ButtonStyle.GRAY,
+            label=f"Make First Offer",
+            emoji="☝",
+            custom_id=f"offer_btn_0_weth_{ens_name}")
+
         return await channel.send(
             f"Exciting announcement! `{ens_name}` has been successfully purchased by {mention(ctx_author)} "
-            f"for `{formatted_price}`!")
+            f"for `{formatted_price}`!", components=components)
     except Exception as e:
         logger.error(f"Error in buy_callback {str(e)}")
         raise e
@@ -1583,32 +1655,30 @@ async def sell_callback(tx, tx_signature, next_action_data):
         ens_name = asset["name"]
         expiration_date = datetime.fromtimestamp(order["expiration_time"])
 
-        price = format_wei_price(order["current_price"], cons_token_name)
+        formatted_price = format_wei_price(order["current_price"], cons_token_name)
 
         if ens_name is None:
             ens_name = f"#{str(token_id)[:10]}"
 
+        asset_url = get_asset_url(contract_address, token_id)
+
         embed = Embed(
-            title=f"View `{ens_name}` on OpenSea",
+            title=f"Our friend {user.display_name} has just listed {ens_name} for sale!",
             fields=[
-                {"name": "Price", "value": f"{price}", "inline": True},
+                {"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
+                {"name": "Offerer", "value": user.mention, "inline": True},
+                {"name": "Price", "value": formatted_price, "inline": True},
                 {"name": "Expiration", "value": format_datetime(expiration_date), "inline": True}
             ],
-            color=BrandColors.GREEN,
-            url=f"https://opensea.io/assets/ethereum/{contract_address}/{token_id}"
-        )
-
-        await user.send(f"Well done! Your listing for `{ens_name}` has been successfully added to OpenSea!",
-                        embeds=embed)
+            color=BrandColors.BLURPLE)
 
         components = Button(
-            style=ButtonStyle.GREEN,
+            style=ButtonStyle.GRAY,
             label=f"Buy",
-            custom_id=f"buy_btn_{ens_name}",
-        )
+            emoji="☝",
+            custom_id=f"buy_btn_{ens_name}")
 
-        await channel.send(f"{user.mention} has just added `{ens_name}` for sale at the price of `{price}`!",
-                           components=components)
+        return await channel.send(f"{user.mention} is selling `{ens_name}`!", embeds=embed, components=components)
     except Exception as e:
         logger.error(f"Error in sell_callback {str(e)}")
         raise e
@@ -1704,26 +1774,31 @@ async def on_item_received_bid(payload, channel):
     if not ens_name:
         return
 
-    if re.search(r"\b\d{3,100}\.eth\b", ens_name):
+    if re.search(r"\b\d{3,100}\.eth\b", ens_name) and with_probability(980):  # There's way too many of these
         return
 
     price = int(payload.get("base_price", 0))
+    expiration_date = datetime.fromtimestamp(
+        int(payload.get("protocol_data", {}).get("parameters", {}).get("endTime", 0)))
     new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
 
     embed = Embed(
-        title=f"{ens_name} has just received an offer",
+        title=f"{ens_name} has just received an offer!",
         fields=[{"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
                 {"name": "Offerer",
-                 "value": f"[{truncate_string(maker, 14)}]({get_os_user_url(maker)})",
+                 "value": format_os_user_url(maker),
                  "inline": True},
                 {"name": "Offer",
                  "value": f"{format_wei_price(price, token_name)}",
+                 "inline": True},
+                {"name": "Expiration",
+                 "value": f"{format_datetime(expiration_date)}",
                  "inline": True}],
         thumbnail=image_url,
-        color=BrandColors.GREEN)
+        color=BrandColors.YELLOW)
 
     components = Button(
-        style=ButtonStyle.GREEN,
+        style=ButtonStyle.GRAY,
         label=f"Make Better Offer",
         emoji="☝",
         custom_id=f"offer_btn_{new_offer_price}_{token_name}_{ens_name}")
@@ -1733,18 +1808,22 @@ async def on_item_received_bid(payload, channel):
 
 async def on_item_sold(payload, channel):
     ens_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+
+    if not ens_name:
+        return
+
     taker = payload.get("taker", {}).get("address", "")
     price = int(payload.get("sale_price", 0))
     new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
 
     embed = Embed(
-        title=f"{ens_name} has just been sold",
+        title=f"{ens_name} has just been sold!",
         fields=[{"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
                 {"name": "Offerer",
-                 "value": f"[{truncate_string(maker, 14)}]({get_os_user_url(maker)})",
+                 "value": format_os_user_url(maker),
                  "inline": True},
                 {"name": "Buyer",
-                 "value": f"[{truncate_string(taker, 14)}]({get_os_user_url(taker)})",
+                 "value": format_os_user_url(taker),
                  "inline": True},
                 {"name": "Price",
                  "value": f"{format_wei_price(price, token_name)}",
@@ -1753,36 +1832,77 @@ async def on_item_sold(payload, channel):
         color=BrandColors.GREEN)
 
     components = Button(
-        style=ButtonStyle.GREEN,
-        label=f"Make Better Offer",
+        style=ButtonStyle.GRAY,
+        label=f"Make New Offer",
         emoji="☝",
         custom_id=f"offer_btn_{new_offer_price}_{token_name}_{ens_name}")
 
     return await channel.send("", embeds=embed, components=components)
 
 
-async def start_stream():
-    channel = bot.get_channel(stream_channel_id)
-    connection_string = f"wss://stream.openseabeta.com/socket/websocket?token={opensea_api_key}"
-    async with websockets.connect(connection_string) as websocket:
-        subscription_message = {
-            "topic": f"collection:ens",
-            "event": "phx_join",
-            "payload": {},
-            "ref": 0
-        }
-        await websocket.send(json.dumps(subscription_message))
+async def on_item_listed(payload, channel):
+    ens_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
 
-        while True:
-            response = await websocket.recv()
-            response = json.loads(response)
-            event = response["event"]
-            payload = response.get("payload", {}).get("payload", {})
-            if event == "item_received_bid":
-                await on_item_received_bid(payload, channel)
-            if event == "item_sold":
-                await on_item_sold(payload, channel)
-            await asyncio.sleep(stream_interval)
+    if not ens_name:
+        return
+
+    price = int(payload.get("base_price", 0))
+    expiration_date = datetime.fromtimestamp(
+        int(payload.get("protocol_data", {}).get("parameters", {}).get("endTime", 0)))
+
+    embed = Embed(
+        title=f"{ens_name} has just been listed for sale!",
+        fields=[{"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
+                {"name": "Offerer",
+                 "value": format_os_user_url(maker),
+                 "inline": True},
+                {"name": "Price",
+                 "value": f"{format_wei_price(price, token_name)}",
+                 "inline": True},
+                {"name": "Expiration",
+                 "value": f"{format_datetime(expiration_date)}",
+                 "inline": True}],
+        thumbnail=image_url,
+        color=BrandColors.BLURPLE)
+
+    components = Button(
+        style=ButtonStyle.GRAY,
+        label=f"Buy",
+        emoji="☝",
+        custom_id=f"buy_btn_{ens_name}")
+
+    return await channel.send("", embeds=embed, components=components)
+
+
+async def start_stream():
+    try:
+        logger.info("Starting OpenSea Stream")
+        channel = bot.get_channel(stream_channel_id)
+        connection_string = f"wss://stream.openseabeta.com/socket/websocket?token={opensea_api_key}"
+        async with websockets.connect(connection_string) as websocket:
+            subscription_message = {
+                "topic": f"collection:ens",
+                "event": "phx_join",
+                "payload": {},
+                "ref": 0
+            }
+            await websocket.send(json.dumps(subscription_message))
+
+            while True:
+                response = await websocket.recv()
+                response = json.loads(response)
+                event = response["event"]
+                payload = response.get("payload", {}).get("payload", {})
+                if event == "item_received_bid":
+                    await on_item_received_bid(payload, channel)
+                elif event == "item_sold":
+                    await on_item_sold(payload, channel)
+                elif event == "item_listed" and with_probability(750):
+                    await on_item_listed(payload, channel)
+                await asyncio.sleep(stream_interval)
+    except Exception as e:
+        logger.error(f"Error in start_stream, will restart: {e}")
+        await start_stream()
 
 
 app = Quart(__name__)
