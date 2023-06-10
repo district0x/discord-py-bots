@@ -57,7 +57,10 @@ class TxDB:
             return cursor.fetchall()
 
     def update_tx_result(self, tx_key, tx_result):
+        print()
         with sqlite3.connect(self.db_file) as conn:
+            print(f"Running SQL: UPDATE tx SET tx_result = ? WHERE tx_key = ? AND tx_result IS NULL")
+            print(f"WITH:  tx_key={tx_key}, tx_result={tx_result}")
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE tx SET tx_result = ? WHERE tx_key = ? AND tx_result IS NULL
