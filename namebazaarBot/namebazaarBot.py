@@ -1914,10 +1914,17 @@ app = cors(app, allow_origin="*")  # reconsider this in prod
 async def user_post():
     data = await request.data
     json_data = json.loads(data.decode())
+    
+    print(json_data)
+    
     tx_key = json_data["txKey"]
     tx_result = json_data["txResult"]
-
-    if not tx_key or not tx_result or not tx_db.tx_key_exists(tx_key):
+    
+    # pring extracted fields
+    print(f"tx_key: {tx_key}")
+    print(f"tx_result: {tx_result}")
+    
+    if not tx_key or not tx_result and not tx_db.tx_key_exists(tx_key):
         abort(400, description='Transaction key is invalid')
 
     if tx_db.tx_result_exists(tx_key):
@@ -1951,7 +1958,7 @@ async def user_post():
 async def main():
     nest_asyncio.apply()
     tasks = [
-        asyncio.create_task(app.run_task(host="localhost", port=server_port)),
+        asyncio.create_task(app.run_task(host="0.0.0.0", port="80")),
         asyncio.create_task(bot.start(namebazaarGPT_token))
     ]
     await asyncio.gather(*tasks)
