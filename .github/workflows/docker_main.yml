@@ -45,13 +45,3 @@ jobs:
           file: docker/Dockerfile.${{ matrix.image }}
           push: true
           tags: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ matrix.image }}-latest
-          # tags: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ matrix.image }}-${{ github.sha }}, ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ matrix.image }}-latest
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ matrix.image }}-${{ github.sha }}
-          format: 'template'
-          template: '@/contrib/sarif.tpl'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
