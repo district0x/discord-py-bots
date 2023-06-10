@@ -131,4 +131,4 @@ dmypy.json
 .pyre/
 /Scripts/
 /pyvenv.cfg
-/namebazaarGPT/nb.db
+/namebazaarBot/nb.db

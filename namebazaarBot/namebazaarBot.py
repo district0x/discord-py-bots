@@ -31,7 +31,7 @@ import random
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("namebazaarGPT")
+logger = logging.getLogger("namebazaarBot")
 
 namebazaarGPT_token = os.getenv('NAMEBAZAAR_GPT_TOKEN')
 namebazaarGPT_client_id = os.getenv('NAMEBAZAAR_GPT_CLIENT_ID')
@@ -1951,7 +1951,7 @@ async def user_post():
 async def main():
     nest_asyncio.apply()
     tasks = [
-        asyncio.create_task(app.run_task(host=server_host, port=server_port)),
+        asyncio.create_task(app.run_task(host="localhost", port=server_port)),
         asyncio.create_task(bot.start(namebazaarGPT_token))
     ]
     await asyncio.gather(*tasks)
