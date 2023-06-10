@@ -4,6 +4,8 @@ async-timeout==4.0.2
 attrs==22.2.0
 charset-normalizer==3.1.0
 discord==2.2.2
+discord-typings==0.5.1
+nest_asyncio
 discord.py==2.2.2
 distlib==0.3.6
 filelock==3.11.0
