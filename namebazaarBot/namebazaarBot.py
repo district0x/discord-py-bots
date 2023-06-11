@@ -46,6 +46,7 @@ tx_check_interval = int(os.getenv('TX_CHECK_INTERVAL'))
 stream_channel_id = int(os.getenv('STREAM_CHANNEL_ID'))
 stream_interval = int(os.getenv('STREAM_INTERVAL'))
 eth_price_cache_expire = 300  # seconds
+db_path = os.getenv('SQLITE_DB_PATH')
 
 contract_addresses = {  # Make sure addresses are checksum format
     "mainnet": {
@@ -93,8 +94,11 @@ intents.guilds = True
 intents.message_content = True
 intents.members = True
 
-tx_db = TxDB('nb.db')
-user_address_db = UserAddressDB('nb.db')
+# tx_db = TxDB('nb.db')
+# user_address_db = UserAddressDB('nb.db')
+
+tx_db = TxDB(db_path)
+user_address_db = UserAddressDB(db_path)
 bot = Client(intents=intents)
 
 tx_link_instruction_text = f"please click on the link above. Upon clicking, the URL will open in your browser, " \
