@@ -1919,14 +1919,8 @@ async def user_post():
     data = await request.data
     json_data = json.loads(data.decode())
     
-    print(json_data)
-    
     tx_key = json_data["txKey"]
     tx_result = json_data["txResult"]
-    
-    # pring extracted fields
-    print(f"tx_key: {tx_key}")
-    print(f"tx_result: {tx_result}")
     
     if not tx_key or not tx_result and not tx_db.tx_key_exists(tx_key):
         abort(400, description='Transaction key is invalid')

@@ -336,8 +336,7 @@ Linked address: ${data.address}`
     }
 
     async function run() {
-        // temporarily commenting out this check
-        // checkPassedHost();
+        checkPassedHost();
         await checkMetaMask();
         if (!provider & isMobileDevice()) {
             openMetamaskDapp();
