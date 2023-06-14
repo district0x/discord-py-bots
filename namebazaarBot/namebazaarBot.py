@@ -6,11 +6,13 @@ import logging
 import os
 import re
 import websockets
+from functools import partial
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
 from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, File, \
     component_callback, ComponentContext, auto_defer
 from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
+from interactions.ext.paginators import Paginator
 from web3 import Web3
 from eth_account.messages import encode_defunct, _hash_eip191_message
 from decimal import Decimal, ROUND_DOWN
@@ -287,6 +289,10 @@ def truncate_string(text, max_length):
         return text[:max_length - 3] + "..."
 
 
+def cure_emoji_name(ens_name):
+    return re.sub(r"\.\w+⚠", "", ens_name)
+
+
 format_time_remaining_units = [
     {'name': 'second', 'limit': 60, 'in_seconds': 1},
     {'name': 'minute', 'limit': 60 * 60, 'in_seconds': 60},
@@ -383,6 +389,35 @@ http_client = httpx.AsyncClient()
 http_cache_client = httpx_cache.AsyncClient()
 
 
+def get_token_info(ens_name):
+    name_label = remove_eth_suffix(ens_name)
+    label_hash = Web3.keccak(text=name_label)
+    node = namehash(ens_name)
+    unwrapped_token_id = int.from_bytes(label_hash, byteorder='big')
+    wrapped_token_id = int.from_bytes(node, byteorder='big')
+    is_wrapped = name_wrapper.functions.isWrapped(node).call()
+    asset_contract_address = name_wrapper.address if is_wrapped else eth_registrar.address
+    token_id = wrapped_token_id if is_wrapped else unwrapped_token_id
+    return (asset_contract_address, token_id, is_wrapped)
+
+
+def get_tx_data_from_fulfillment(fulfillment, order_type):
+    fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
+    fn_name = fn_signature.split("(")[0]
+    tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
+    tx_to = Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])
+    if order_type == "basic":
+        parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
+        args = prepare_tx_args(parameters)
+        tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(args)])
+    elif order_type == "dutch":
+        order = fulfillment["fulfillment_data"]["transaction"]["input_data"]["order"]
+        fulfiller_conduit_key = fulfillment["fulfillment_data"]["transaction"]["input_data"]["fulfillerConduitKey"]
+        order_args = prepare_tx_args(order)
+        tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(order_args), fulfiller_conduit_key])
+    return tx_data, tx_value, tx_to
+
+
 async def get_eth_usd_price():
     response = await http_cache_client.get(
         f"https://api.etherscan.io/api?module=stats&action=ethprice&apikey={etherscan_api_key}",
@@ -407,6 +442,18 @@ async def get_highest_bid(asset_contract_address, token_id):
         offer = offers["orders"][0]["protocol_data"]["parameters"]["offer"][0]
         return int(offer["startAmount"]), offer["token"]
     return (None, None)
+
+
+async def get_offers(asset_contract_address, token_id):
+    url = f"{get_opensea_url('offers')}?" \
+          f"asset_contract_address={asset_contract_address}&" \
+          f"token_ids={token_id}&" \
+          f"order_by=eth_price&" \
+          f"order_direction=desc&" \
+          f"limit=5"
+
+    response = await http_client.get(url, headers=os_api_headers)
+    return response.json()
 
 
 async def get_cheapest_listing(asset_contract_address, token_id):
@@ -443,6 +490,10 @@ async def get_fulfillment(order_hash, protocol_address, user_address):
 
     response = await http_client.post(url, json=payload, headers=os_api_headers)
     return response.json()
+
+
+async def send_invalid_name_msg(ctx, ens_name):
+    return await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
 
 
 def get_asset_url(asset_contract_address, token_id):
@@ -592,8 +643,6 @@ async def approve_erc20_allowance(ctx: SlashContext, ens_name, user_address, pri
 async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_data, tx_value, ctx_author_id,
                           ctx_channel_id, expiration_time, highest_bid, is_bid, asset_url):
     try:
-        seaport = web3.eth.contract(address=tx_to, abi=seaport_abi)
-
         tx = {
             "to": tx_to,
             "from": tx_from,
@@ -669,8 +718,7 @@ async def send_buy_tx_url(ctx, ens_name, price, token_name, tx_to, tx_from, tx_d
 async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
     try:
         ens_name = add_eth_suffix(ens_name)
-        cured_name = ens_cure(ens_name)
-        cured_name = re.sub(r"\.\w+⚠", "", cured_name) ## OpenSea Emoji names contain this for some reason
+        cured_name = cure_emoji_name(ens_cure(ens_name))
 
         if not is_top_level_eth(cured_name):
             await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
@@ -681,15 +729,7 @@ async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
             return await _link_wallet(
                 ctx, "To buy an ENS name, we need your Ethereum address associated with your Discord account.")
 
-        name_label = remove_eth_suffix(cured_name)
-
-        label_hash = Web3.keccak(text=name_label)
-        node = namehash(cured_name)
-        unwrapped_token_id = int.from_bytes(label_hash, byteorder='big')
-        wrapped_token_id = int.from_bytes(node, byteorder='big')
-        is_wrapped = name_wrapper.functions.isWrapped(node).call()
-        asset_contract_address = name_wrapper.address if is_wrapped else eth_registrar.address
-        token_id = wrapped_token_id if is_wrapped else unwrapped_token_id
+        asset_contract_address, token_id, is_wrapped = get_token_info(cured_name)
         eth_usd_price = await get_eth_usd_price()
         bid_wei = None
         highest_bid = None
@@ -748,9 +788,6 @@ async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
                 return await ctx.send(
                     f"It seems like OpenSea is still preparing this name, please try again in a few seconds",
                     ephemeral=True)
-            fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
-            fn_name = fn_signature.split("(")[0]
-            tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
         else:
             bid = restrict_to_multiples(Decimal(str(bid)))
             is_worth, usd_worth = min_usd_worth(bid, 5, eth_usd_price, cons_token_name)
@@ -765,15 +802,8 @@ async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
             else:
                 bid_wei = safe_to_wei(bid, cons_token_name)
 
-        if not bid_wei and order_type == "basic":
-            parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
-            args = prepare_tx_args(parameters)
-            tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(args)])
-        elif not bid_wei and order_type == "dutch":
-            order = fulfillment["fulfillment_data"]["transaction"]["input_data"]["order"]
-            fulfiller_conduit_key = fulfillment["fulfillment_data"]["transaction"]["input_data"]["fulfillerConduitKey"]
-            order_args = prepare_tx_args(order)
-            tx_data = seaport.encodeABI(fn_name=fn_name, args=[list(order_args), fulfiller_conduit_key])
+        if not bid_wei and (order_type == "basic" or order_type == "dutch"):
+            tx_data, tx_value, tx_to = get_tx_data_from_fulfillment(fulfillment, order_type)
         elif bid_wei or order_type == "english":
             is_bid = True
             highest_bid, _ = await get_highest_bid(asset_contract_address, token_id)
@@ -795,8 +825,8 @@ async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
                 offer_start_amount=current_price,
                 offer_end_amount=current_price,
                 cons_item_type=3 if is_wrapped else 2,
-                cons_token=name_wrapper.address if is_wrapped else eth_registrar.address,
-                cons_token_id=wrapped_token_id if is_wrapped else unwrapped_token_id,
+                cons_token=asset_contract_address,
+                cons_token_id=token_id,
                 cons_start_amount=1,
                 cons_end_amount=1,
                 cons_recepient=user_address,
@@ -847,7 +877,7 @@ async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
             ctx_channel_id=ctx.channel_id)
 
     except DisallowedNameError as e:
-        await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
+        await send_invalid_name_msg(ctx, ens_name)
     except Exception as e:
         await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of `{ens_name}`.",
                        ephemeral=True)
@@ -903,6 +933,112 @@ async def offer_btn_callback(ctx: ComponentContext):
         await _buy(ctx, ens_name, price, token_name, force_bid=True)
     else:
         await ctx.send("Sorry, there's a problem with this action", ephemeral=True)
+
+
+async def on_accept_offer_btn(ctx, paginator, offers):
+    offer = offers[paginator.page_index]
+    fulfillment = await get_fulfillment(offer["order_hash"], offer["protocol_address"], offer["user_address"])
+    tx_data, tx_value, tx_to = get_tx_data_from_fulfillment(fulfillment, offer["order_type"])
+
+    tx = {
+        "to": tx_to,
+        "from": offer["user_address"],
+        "data": compress_string_to_url(tx_data),
+        "value": tx_value
+    }
+    tx_key = generate_tx_key()
+    tx_url = get_tx_page_url(tx_key, tx)
+
+    tx_db.add_tx(
+        {"tx_key": tx_key,
+         "user": ctx.author_id,
+         "action": "accept_offer",
+         "channel": ctx.channel_id,
+         "next_action_data": json.dumps({})})
+
+    embed = Embed(
+        title=f"Accept offer",
+        description=f"In order to accept offer, {tx_link_instruction_text}",
+        fields=offer["fields"],
+        color=BrandColors.GREEN,
+        url=tx_url)
+
+    return await ctx.send(f"You selected order:", embeds=embed, ephemeral=True)
+
+
+@slash_command(name="offers", description="List of offers/bid for a given ENS name")
+@auto_defer(ephemeral=True)
+@slash_option(
+    name="ens_name",
+    description="Please provide the ENS name that you wish to get offers for.",
+    required=True,
+    opt_type=OptionType.STRING,
+    max_length=100,
+    min_length=3
+)
+async def offers(ctx: SlashContext, ens_name):
+    try:
+        ens_name = add_eth_suffix(ens_name)
+        cured_name = cure_emoji_name(ens_cure(ens_name))
+
+        if not is_top_level_eth(cured_name):
+            await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
+                           ephemeral=True)
+            return
+        user_address = user_address_db.get_address(ctx.author_id)
+
+        asset_contract_address, token_id, is_wrapped = get_token_info(cured_name)
+
+        offers = await get_offers(asset_contract_address, token_id)
+        asset_url = get_asset_url(asset_contract_address, token_id)
+
+        if not "orders" in offers or len(offers["orders"]) == 0:
+            return await ctx.send(f"It seems that no offers are present for this particular name.", ephemeral=True)
+
+        embeds = []
+        offers_data = []
+        for i, offer in enumerate(offers["orders"]):
+            created = format_datetime(datetime.fromtimestamp(offer["listing_time"]))
+            expiration = format_datetime(datetime.fromtimestamp(offer["expiration_time"]))
+            offerer = offer.get("maker", {}).get("address", "")
+            offer_token = offer.get("protocol_data", {}).get("parameters", {}).get("offer", [])[0].get("token", "")
+            offer_token_name, _ = get_token_contract(offer_token)
+            price = offer["current_price"]
+            maker_img_url = offer.get("maker", {}).get("profile_img_url", "")
+
+            fields = [
+                {"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
+                {"name": "Offerer", "value": format_os_user_url(offerer), "inline": True},
+                {"name": "Created", "value": created, "inline": True},
+                {"name": "Expiration", "value": expiration, "inline": True},
+                {"name": "Price", "value": format_wei_price(price, offer_token_name), "inline": True}]
+            embed = Embed(
+                title=f"Offer #{i + 1}",
+                fields=fields,
+                color=BrandColors.WHITE,
+                thumbnail=maker_img_url)
+            embeds.append(embed)
+            offers_data.append(
+                {"ens_name": cured_name,
+                 "order_hash": offer["order_hash"],
+                 "protocol_address": offer["protocol_address"],
+                 "order_type": offer["order_type"],
+                 "user_address": user_address,
+                 "fields": fields})
+
+        paginator = Paginator.create_from_embeds(bot, *embeds)
+        paginator.default_button_color = ButtonStyle.GRAY
+        paginator.show_callback_button = True
+        paginator.callback = partial(on_accept_offer_btn, paginator=paginator, offers=offers_data)
+        return await paginator.send(ctx)
+
+    except DisallowedNameError as e:
+        await send_invalid_name_msg(ctx, ens_name)
+    except Exception as e:
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the purchase of `{ens_name}`.",
+                       ephemeral=True)
+        logger.error(f"Buy command exception {str(e)}")
+        raise e
 
 
 async def _link_wallet(ctx: SlashContext, ctx_message):
@@ -1252,7 +1388,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
             ctx_author_id=ctx.author_id,
             ctx_channel_id=ctx.channel_id)
     except DisallowedNameError as e:
-        await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
+        await send_invalid_name_msg(ctx, ens_name)
     except Exception as e:
         await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the selling of `{cured_name}`.",
                        ephemeral=True)
@@ -1456,7 +1592,7 @@ async def register(ctx: SlashContext, ens_name):
                        ephemeral=True)
 
     except DisallowedNameError as e:
-        await ctx.send(f"I apologize, but the name `{ens_name}` cannot be accepted for registration.", ephemeral=True)
+        await send_invalid_name_msg(ctx, ens_name)
     except Exception as e:
         # Handle the exception here
         logger.error(f"error in register {str(e)}")
