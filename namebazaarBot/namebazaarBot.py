@@ -492,6 +492,50 @@ async def get_fulfillment(order_hash, protocol_address, user_address):
     return response.json()
 
 
+async def get_name_owner(ens_name):
+    name_label = remove_eth_suffix(ens_name)
+    node = namehash(ens_name)
+    hex_node = node.hex()
+    label_hash = Web3.keccak(text=name_label)
+    token_id = int.from_bytes(label_hash, byteorder='big')
+    hex_label = hex(token_id)
+
+    query = f"""
+                    {{
+                      registration(
+                        id: "{hex_label}"
+                      ) {{
+                        registrant {{
+                          id
+                        }}
+                      }}
+                      wrappedDomain(
+                        id: "{hex_node}"
+                      ) {{
+                        owner {{
+                          id
+                        }}
+                      }}
+                    }}
+                    """
+    response = await http_client.post(subgraph_url, json={"query": query})
+    data = response.json().get('data', {})
+    registration = data.get('registration')
+    wrapped_domain = data.get('wrappedDomain')
+
+    owner = None
+    is_wrapped = False
+    if registration is not None:
+        owner = registration.get('registrant', {}).get('id')
+
+    if wrapped_domain is not None:
+        owner = wrapped_domain.get('owner', {}).get('id')
+        token_id = int.from_bytes(node, byteorder='big')
+        is_wrapped = True
+
+    return owner, token_id, is_wrapped
+
+
 async def send_invalid_name_msg(ctx, ens_name):
     return await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
 
@@ -739,8 +783,8 @@ async def _buy(ctx, ens_name, bid=None, currency=None, force_bid=False):
 
         if (not bid or not currency) and not cheapest_listing:
             highest_bid, highest_bid_token = await get_highest_bid(asset_contract_address, token_id)
-            highest_bid_token_name, _ = get_token_contract(highest_bid_token)
             if highest_bid:
+                highest_bid_token_name, _ = get_token_contract(highest_bid_token)
                 highest_bid_msg = f"Current highest bid is `{format_wei_price(highest_bid, highest_bid_token_name)}`."
             else:
                 highest_bid_msg = "Currently there are no other offers for this name."
@@ -954,16 +998,16 @@ async def on_accept_offer_btn(ctx, paginator, offers):
          "user": ctx.author_id,
          "action": "accept_offer",
          "channel": ctx.channel_id,
-         "next_action_data": json.dumps({})})
+         "next_action_data": json.dumps(offer)})
 
     embed = Embed(
-        title=f"Accept offer",
-        description=f"In order to accept offer, {tx_link_instruction_text}",
+        title=f"Accept an offer for `{offer['ens_name']}`",
+        description=f"In order to accept this offer, {tx_link_instruction_text}",
         fields=offer["fields"],
         color=BrandColors.GREEN,
         url=tx_url)
 
-    return await ctx.send(f"You selected order:", embeds=embed, ephemeral=True)
+    return await ctx.send(f"You're about to accept the following offer for your name:", embeds=embed, ephemeral=True)
 
 
 @slash_command(name="offers", description="List of offers/bid for a given ENS name")
@@ -974,8 +1018,7 @@ async def on_accept_offer_btn(ctx, paginator, offers):
     required=True,
     opt_type=OptionType.STRING,
     max_length=100,
-    min_length=3
-)
+    min_length=3)
 async def offers(ctx: SlashContext, ens_name):
     try:
         ens_name = add_eth_suffix(ens_name)
@@ -1003,15 +1046,20 @@ async def offers(ctx: SlashContext, ens_name):
             offerer = offer.get("maker", {}).get("address", "")
             offer_token = offer.get("protocol_data", {}).get("parameters", {}).get("offer", [])[0].get("token", "")
             offer_token_name, _ = get_token_contract(offer_token)
-            price = offer["current_price"]
+            price = int(offer["current_price"])
             maker_img_url = offer.get("maker", {}).get("profile_img_url", "")
+            eth_usd_price = await get_eth_usd_price()
+            usd_price = get_usd_price(safe_to_ether(price, offer_token_name), eth_usd_price, offer_token_name)
+            formatted_price = format_wei_price(price, offer_token_name)
 
             fields = [
                 {"name": "ENS name", "value": f"[{ens_name}]({asset_url})", "inline": True},
                 {"name": "Offerer", "value": format_os_user_url(offerer), "inline": True},
                 {"name": "Created", "value": created, "inline": True},
                 {"name": "Expiration", "value": expiration, "inline": True},
-                {"name": "Price", "value": format_wei_price(price, offer_token_name), "inline": True}]
+                {"name": "Price", "value": formatted_price, "inline": True},
+                {"name": "USD Value", "value": format_eth_price(usd_price, "USD", 2), "inline": True}
+            ]
             embed = Embed(
                 title=f"Offer #{i + 1}",
                 fields=fields,
@@ -1024,11 +1072,17 @@ async def offers(ctx: SlashContext, ens_name):
                  "protocol_address": offer["protocol_address"],
                  "order_type": offer["order_type"],
                  "user_address": user_address,
+                 "formatted_price": formatted_price,
                  "fields": fields})
 
         paginator = Paginator.create_from_embeds(bot, *embeds)
         paginator.default_button_color = ButtonStyle.GRAY
-        paginator.show_callback_button = True
+
+        owner, _, _ = await get_name_owner(cured_name)
+
+        if owner.lower() == user_address.lower():
+            paginator.show_callback_button = True
+
         paginator.callback = partial(on_accept_offer_btn, paginator=paginator, offers=offers_data)
         return await paginator.send(ctx)
 
@@ -1314,45 +1368,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
             return await ctx.send(f"Apologies, but at the moment, our support is limited to top-level .eth names only.",
                                   ephemeral=True)
 
-        name_label = remove_eth_suffix(cured_name)
-        node = namehash(cured_name)
-        hex_node = node.hex()
-        label_hash = Web3.keccak(text=name_label)
-        token_id = int.from_bytes(label_hash, byteorder='big')
-        hex_label = hex(token_id)
-
-        query = f"""
-                {{
-                  registration(
-                    id: "{hex_label}"
-                  ) {{
-                    registrant {{
-                      id
-                    }}
-                  }}
-                  wrappedDomain(
-                    id: "{hex_node}"
-                  ) {{
-                    owner {{
-                      id
-                    }}
-                  }}
-                }}
-                """
-        response = await http_client.post(subgraph_url, json={"query": query})
-        data = response.json().get('data', {})
-        registration = data.get('registration')
-        wrapped_domain = data.get('wrappedDomain')
-
-        owner = None
-        is_wrapped = False
-        if registration is not None:
-            owner = registration.get('registrant', {}).get('id')
-
-        if wrapped_domain is not None:
-            owner = wrapped_domain.get('owner', {}).get('id')
-            token_id = int.from_bytes(node, byteorder='big')
-            is_wrapped = True
+        owner, token_id, is_wrapped = await get_name_owner(cured_name)
 
         if owner is None or owner.lower() != user_address.lower():
             await ctx.send(f"It appears that you don't own `{cured_name}`.", ephemeral=True)
@@ -1744,7 +1760,6 @@ async def buy_callback(tx, tx_hash, next_action_data):
         channel = bot.get_channel(int(tx["channel"]))
         ens_name = next_action_data["ens_name"]
         formatted_price = next_action_data["formatted_price"]
-        token_name = next_action_data["token_name"]
         ctx_author = tx["user"]
 
         components = Button(
@@ -1893,6 +1908,28 @@ async def approve_erc20_allowance_callback(tx, tx_hash, next_action_data):
             ctx_channel_id=tx["channel"])
     except Exception as e:
         logger.error(f"Error in approve_erc20_allowance_callback {str(e)}")
+        raise e
+
+
+async def accept_offer_callback(tx, tx_hash, next_action_data):
+    try:
+        await wait_for_receipt(tx_hash)
+        channel = bot.get_channel(int(tx["channel"]))
+        ens_name = next_action_data["ens_name"]
+        formatted_price = next_action_data["formatted_price"]
+        ctx_author = tx["user"]
+
+        components = Button(
+            style=ButtonStyle.GRAY,
+            label=f"Make First Offer",
+            emoji="☝",
+            custom_id=f"offer_btn_0_weth_{ens_name}")
+
+        return await channel.send(
+            f"Exciting announcement! {mention(ctx_author)} has accepted the offer to sell `{ens_name}` "
+            f"for `{formatted_price}`!", components=components)
+    except Exception as e:
+        logger.error(f"Error in buy_callback {str(e)}")
         raise e
 
 
@@ -2078,6 +2115,8 @@ async def user_post():
         asyncio.create_task(approve_opensea_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "approve_erc20_allowance":
         asyncio.create_task(approve_erc20_allowance_callback(tx, tx_result, next_action_data))
+    elif tx["action"] == "accept_offer":
+        asyncio.create_task(accept_offer_callback(tx, tx_result, next_action_data))
     elif tx["action"] == "link_wallet":
         asyncio.create_task(link_wallet_callback(tx, tx_result, json_data["message"], next_action_data))
 
