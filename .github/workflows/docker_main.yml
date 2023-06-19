@@ -44,4 +44,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           file: docker/Dockerfile.${{ matrix.image }}
           push: true
-          tags: ${{ secrets.ECR_REGISTRY }}/discord-py-bots:${{ matrix.image }}-latest
+          tags: ${{ secrets.ECR_REGISTRY }}/discord-${{ matrix.image }}:latest
