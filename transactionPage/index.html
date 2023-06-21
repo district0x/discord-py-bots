@@ -2,12 +2,32 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ethereum Transaction</title>
     <script src="https://unpkg.com/@metamask/detect-provider/dist/detect-provider.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
+    <style>
+        html, body {
+            font-size: 1.1em;
+            height: 100%;
+            margin: 0;
+        }
 
+        .container {
+            display: grid;
+            place-items: center; /* Center the content both horizontally and vertically */
+            height: 100%;
+        }
+
+        .content {
+        }
+    </style>
 </head>
 <body>
+<div class="container">
+    <div class="content">
+    </div>
+</div>
 <script type="text/javascript">
     const signTxSpecs = {
         "OrderComponents": {
@@ -68,6 +88,7 @@ Linked address: ${data.address}`
     let provider = false;
     let listeningOnAccountsChanged = false;
     let correctAccount = false;
+    var contentEl = document.querySelector(".content");
 
     async function checkMetaMask() {
         provider = await detectEthereumProvider();
@@ -75,8 +96,7 @@ Linked address: ${data.address}`
         if (provider) {
             console.log("MetaMask installed");
         } else {
-            var body = document.body;
-            body.textContent = "Please install MetaMask browser extension";
+            contentEl.textContent = "Please install MetaMask browser extension";
         }
     }
 
@@ -137,23 +157,20 @@ Linked address: ${data.address}`
                 }
             }).then(response => {
                 if (response.ok) {
-                    let body = document.body;
-                    body.textContent = "Your transaction has been successfully sent, you can close this tab now.";
+                    contentEl.textContent = "Your transaction has been successfully sent, you can close this tab now.";
                 } else if (response.status === 409) {
-                    body.textContent = "This transaction has already been processed by our servers.";
+                    contentEl.textContent = "This transaction has already been processed by our servers.";
                 } else {
-                    let body = document.body;
-                    body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
+                    contentEl.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
                     console.log(response);
                 }
             }).catch(error => {
-                let body = document.body;
-                body.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
+                contentEl.textContent = "Your transaction has been sent, but we failed to reach our Discord.";
                 console.log(error);
             });
         } catch (error) {
             console.error(error);
-            document.body.textContent = "Transaction has not been sent";
+            contentEl.textContent = "Transaction has not been sent";
         }
     }
 
@@ -221,10 +238,8 @@ Linked address: ${data.address}`
                 console.log(response);
             });
         } else if (signSpec.signMethod === "personalSign") {
-            console.log(data)
             data.address = accounts[0];
             let message = signSpec.messageTemplate(data);
-            console.log(message)
             const encodedMessage = new TextEncoder().encode(message);
             message = '0x' + Array.from(encodedMessage).map(byte => byte.toString(16).padStart(2, '0')).join('');
             let body = document.body;
@@ -248,20 +263,20 @@ Linked address: ${data.address}`
                         }
                     }).then(response => {
                         if (response.ok) {
-                            body.textContent = "Your signature was successfully sent to the Discord. You can close this tab now.";
+                            contentEl.textContent = "Your signature was successfully sent to the Discord. You can close this tab now.";
                         } else if (response.status === 409) {
-                            body.textContent = "This transaction has already been processed by our servers.";
+                            contentEl.textContent = "This transaction has already been processed by our servers.";
                         } else {
-                            body.textContent = "Your signature is correct, but we failed to reach our Discord.";
+                            contentEl.textContent = "Your signature is correct, but we failed to reach our Discord.";
                             console.log(response);
                         }
                     }).catch(error => {
-                        body.textContent = "Your signature is correct, but we failed to reach our Discord.";
+                        contentEl.textContent = "Your signature is correct, but we failed to reach our Discord.";
                         console.log(error);
                     });
                 })
                 .catch((err) => {
-                    body.textContent = "Signing has not been completed.";
+                    contentEl.textContent = "Signing has not been completed.";
                 });
         }
     }
@@ -279,16 +294,15 @@ Linked address: ${data.address}`
                     window.ethereum.on("accountsChanged", popupTransaction);
                     listeningOnAccountsChanged = true;
                 }
-                body.textContent = "Please switch your account to: " + from;
+                contentEl.textContent = "Please switch your account to: " + from;
             } else {
                 correctAccount = true;
-                body.textContent = "Please confirm your transaction.";
+                contentEl.textContent = "Please confirm your transaction.";
             }
             return accounts;
         } catch (error) {
             console.error(error);
-            let body = document.body;
-            body.textContent = "Account has not been selected";
+            contentEl.textContent = "Account has not been selected";
         }
     }
 
@@ -305,7 +319,8 @@ Linked address: ${data.address}`
     function openMetamaskDapp() {
         let url = window.location.href;
         let newLocation = url.slice(url.indexOf("//") + 2);
-        window.location.href = "https://metamask.app.link/dapp/" + newLocation;
+        let href = "https://metamask.app.link/dapp/" + newLocation;
+        contentEl.innerHTML = "<a href='" + href + "'>Open Metamask</a>";
     }
 
     function checkPassedHost() {
@@ -347,6 +362,5 @@ Linked address: ${data.address}`
 
     run();
 </script>
-
 </body>
 </html>
