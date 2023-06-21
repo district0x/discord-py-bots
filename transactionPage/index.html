@@ -125,8 +125,7 @@ Linked address: ${data.address}`
     async function sendTransaction() {
 
         if (typeof BigInt === "undefined") {
-            let body = document.body;
-            body.textContent = "BigInt is not supported in this browser";
+            contentEl.textContent = "BigInt is not supported in this browser";
             console.log("BigInt is not supported in this browser");
         }
 
@@ -136,8 +135,6 @@ Linked address: ${data.address}`
             value: "0x" + BigInt(getURLParameter("value")).toString(16),
             data: decompressFromUrl(getURLParameter("data"))
         };
-
-        console.log(txParams);
 
         try {
             const txResult = await ethereum.request({
@@ -204,9 +201,8 @@ Linked address: ${data.address}`
                 params: [getURLParameter("from"), msgParams],
                 from: getURLParameter("from")
             }, function (err, response) {
-                let body = document.body;
                 if (err) {
-                    body.textContent = "Apologies, but there was an issue with signing the data.";
+                    contentEl.textContent = "Apologies, but there was an issue with signing the data.";
                     return;
                 }
 
@@ -224,15 +220,15 @@ Linked address: ${data.address}`
                     }
                 }).then(response => {
                     if (response.ok) {
-                        body.textContent = "Your data was successfully signed and sent to the Discord. You can close this tab now.";
+                        contentEl.textContent = "Your data was successfully signed and sent to the Discord. You can close this tab now.";
                     } else if (response.status === 409) {
-                        body.textContent = "This transaction has already been processed by our servers.";
+                        contentEl.textContent = "This transaction has already been processed by our servers.";
                     } else {
-                        body.textContent = "Your data was signed, but we failed to reach our Discord.";
+                        contentEl.textContent = "Your data was signed, but we failed to reach our Discord.";
                         console.log(response);
                     }
                 }).catch(error => {
-                    body.textContent = "Your data was signed, but we failed to reach our Discord.";
+                    contentEl.textContent = "Your data was signed, but we failed to reach our Discord.";
                     console.log(error);
                 });
 
@@ -243,7 +239,6 @@ Linked address: ${data.address}`
             let message = signSpec.messageTemplate(data);
             const encodedMessage = new TextEncoder().encode(message);
             message = '0x' + Array.from(encodedMessage).map(byte => byte.toString(16).padStart(2, '0')).join('');
-            let body = document.body;
             window.ethereum
                 .request({
                     method: 'personal_sign',
@@ -287,7 +282,6 @@ Linked address: ${data.address}`
             accounts = await ethereum.request({
                 method: 'eth_requestAccounts'
             });
-            let body = document.body;
             from = getURLParameter("from")
             if (from && from.toLowerCase() !== accounts[0].toLowerCase()) {
                 correctAccount = false;
@@ -329,8 +323,7 @@ Linked address: ${data.address}`
         const host = getURLParameter("host");
 
         if (!allowedHostnames.test(host)) {
-            let body = document.body;
-            body.textContent = "Passed host is not allowed";
+            contentEl.textContent = "Passed host is not allowed";
             throw new Error("Passed host is not allowed");
         }
     }
