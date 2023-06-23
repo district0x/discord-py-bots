@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
-from helpers.APICounter import APICounter
+from ethlanceGPT.APICounter import APICounter
 
 primer = f"""
 My only purpose is to categorise user input into 5 categories. 

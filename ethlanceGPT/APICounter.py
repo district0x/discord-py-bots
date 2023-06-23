@@ -9,7 +9,6 @@ class APICounter:
     Attributes:
         max_requests_per_day (int): The maximum number of requests allowed per day.
         requests (dict): A dictionary that stores the request count for each user, keyed by user ID.
-
     Methods:
         __init__(self, max_requests_per_day):
             Initializes a new instance of the APICounter class with the specified maximum limit of requests per day.
