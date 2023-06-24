@@ -386,24 +386,25 @@ async def approve_erc20_allowance(
     try:
         tx_key = generate_tx_key()
 
-        tx_db.add_tx({"tx_key": tx_key,
-                      "user": ctx.author_id,
-                      "action": "approve_erc20_allowance",
-                      "channel": ctx.channel_id,
-                      "next_action_data": json.dumps(
-                          {"asset_name": asset_name,
-                           "price": price,
-                           "highest_bid": highest_bid,
-                           "expiration_time": expiration_time,
-                           "token_name": token_name,
-                           "is_bid": is_bid,
-                           "asset_url": asset_url,
-                           "asset_img": asset_img,
-                           "token_id": token_id,
-                           "next_tx_to": next_tx_to,
-                           "next_tx_from": user_address,
-                           "next_tx_data": next_tx_data,
-                           "next_tx_value": next_tx_value})})
+        tx_db.add_tx(
+            {"tx_key": tx_key,
+             "user": ctx.author_id,
+             "action": "approve_erc20_allowance",
+             "channel": ctx.channel_id,
+             "next_action_data": json.dumps(
+                 {"asset_name": asset_name,
+                  "price": price,
+                  "highest_bid": highest_bid,
+                  "expiration_time": expiration_time,
+                  "token_name": token_name,
+                  "is_bid": is_bid,
+                  "asset_url": asset_url,
+                  "asset_img": asset_img,
+                  "token_id": token_id,
+                  "next_tx_to": next_tx_to,
+                  "next_tx_from": user_address,
+                  "next_tx_data": next_tx_data,
+                  "next_tx_value": next_tx_value})})
         tx_data = token_contract.encodeABI(fn_name="approve", args=[opensea_conduit.address, price])
 
         tx = {
@@ -549,7 +550,7 @@ async def buy(
         if (not bid or not currency) and not cheapest_listing:
             highest_bid, highest_bid_token = await get_highest_bid(asset_contract_address, token_id)
             if highest_bid:
-                highest_bid_token_name, _ = get_token_contract(highest_bid_token)
+                highest_bid_token_name, _ = get_token_contract(web3, highest_bid_token)
                 highest_bid_msg = f"Current highest bid is `{format_wei_price(highest_bid, highest_bid_token_name)}`."
             else:
                 highest_bid_msg = "Currently there are no other offers for this NFT."
@@ -569,10 +570,10 @@ async def buy(
 
         if currency:
             cons_token = get_token_address(currency)
-            cons_token_name, cons_token_contract = get_token_contract(cons_token)
+            cons_token_name, cons_token_contract = get_token_contract(web3, cons_token)
         else:
             cons_token = cheapest_listing["protocol_data"]["parameters"]["consideration"][0]["token"]
-            cons_token_name, cons_token_contract = get_token_contract(cons_token)
+            cons_token_name, cons_token_contract = get_token_contract(web3, cons_token)
 
         if (not bid or not currency) and cheapest_listing:
             current_price = int(cheapest_listing["current_price"])
@@ -730,7 +731,8 @@ async def on_accept_offer_btn(ctx, tx_db: TxDB, paginator, offers):
 
 
 async def offers(
-        ctx: SlashContext, user_address_db: UserAddressDB, tx_db: TxDB, asset_contract_address, token_id, asset_name):
+        ctx: SlashContext, user_address_db: UserAddressDB, tx_db: TxDB, web3, asset_contract_address, token_id,
+        asset_name):
     try:
         user_address = user_address_db.get_address(ctx.author_id)
 
@@ -747,7 +749,7 @@ async def offers(
             expiration = format_datetime(datetime.fromtimestamp(offer["expiration_time"]))
             offerer = offer.get("maker", {}).get("address", "")
             offer_token = offer.get("protocol_data", {}).get("parameters", {}).get("offer", [])[0].get("token", "")
-            offer_token_name, _ = get_token_contract(offer_token)
+            offer_token_name, _ = get_token_contract(web3, offer_token)
             price = int(offer["current_price"])
             maker_img_url = offer.get("maker", {}).get("profile_img_url", "")
             eth_usd_price = await get_eth_usd_price()
@@ -770,6 +772,7 @@ async def offers(
             embeds.append(embed)
             offers_data.append(
                 {"asset_name": asset_name,
+                 "token_id": token_id,
                  "order_hash": offer["order_hash"],
                  "protocol_address": offer["protocol_address"],
                  "order_type": offer["order_type"],
@@ -980,6 +983,7 @@ async def bid_callback(bot, tx, tx_signature, next_action_data):
             return
 
         asset_name = next_action_data["asset_name"]
+        token_id = next_action_data["token_id"]
         formatted_price = next_action_data["formatted_price"]
         token_name = next_action_data["token_name"]
         expiration_datetime = datetime.fromtimestamp(next_action_data["expiration_time"])
@@ -988,7 +992,7 @@ async def bid_callback(bot, tx, tx_signature, next_action_data):
             style=ButtonStyle.GRAY,
             label=f"Make Better Offer",
             emoji="☝",
-            custom_id=f"offer_btn_0_weth_{next_action_data['button_id']}",
+            custom_id=f"offer_btn_0_weth_{get_button_id(asset_name, token_id)}",
         )
 
         return await channel.send(
@@ -1000,11 +1004,12 @@ async def bid_callback(bot, tx, tx_signature, next_action_data):
         raise e
 
 
-async def buy_callback(web3, tx, tx_hash, next_action_data):
+async def buy_callback(bot, web3, tx, tx_hash, next_action_data):
     try:
         await discord_web3.wait_for_receipt(tx_hash)
         channel = bot.get_channel(int(tx["channel"]))
         asset_name = next_action_data["asset_name"]
+        token_id = next_action_data["token_id"]
         formatted_price = next_action_data["formatted_price"]
         ctx_author = tx["user"]
 
@@ -1012,7 +1017,7 @@ async def buy_callback(web3, tx, tx_hash, next_action_data):
             style=ButtonStyle.GRAY,
             label=f"Make First Offer",
             emoji="☝",
-            custom_id=f"offer_btn_0_weth_{next_action_data['button_id']}")
+            custom_id=f"offer_btn_0_weth_{get_button_id(asset_name, token_id)}")
 
         return await channel.send(
             f"Exciting announcement! `{asset_name}` has been successfully purchased by {mention(ctx_author)} "
@@ -1134,3 +1139,152 @@ async def approve_erc20_allowance_callback(bot, web3, tx_db: TxDB, tx, tx_hash, 
     except Exception as e:
         logger.error(f"Error in approve_erc20_allowance_callback {str(e)}")
         raise e
+
+
+async def accept_offer_callback(bot, web3, tx, tx_hash, next_action_data):
+    try:
+        await discord_web3.wait_for_receipt(web3, tx_hash)
+        channel = bot.get_channel(int(tx["channel"]))
+        asset_name = next_action_data["asset_name"]
+        token_id = next_action_data["token_id"]
+        formatted_price = next_action_data["formatted_price"]
+        ctx_author = tx["user"]
+
+        components = Button(
+            style=ButtonStyle.GRAY,
+            label=f"Make First Offer",
+            emoji="☝",
+            custom_id=f"offer_btn_0_weth_{get_button_id(asset_name, token_id)}")
+
+        return await channel.send(
+            f"Exciting announcement! {mention(ctx_author)} has accepted the offer to sell `{asset_name}` "
+            f"for `{formatted_price}`!", components=components)
+    except Exception as e:
+        logger.error(f"Error in accept_offer_callback {str(e)}")
+        raise e
+
+
+def get_payload_basic_info(payload):
+    asset_name = payload.get("item", {}).get("metadata", {}).get("name", "")
+    permalink = payload.get("item", {}).get("permalink", "")
+    image_url = payload.get("item", {}).get("metadata", {}).get("image_url", "")
+    token_symbol = payload.get("payment_token", {}).get("symbol", "").lower()
+    maker = payload.get("maker", {}).get("address", "")
+    return asset_name, permalink, image_url, token_symbol, maker
+
+
+async def on_item_received_bid(payload, channel):
+    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+
+    if not asset_name:
+        return
+
+    # if re.search(r"\b\d{3,100}\.eth\b", asset_name) and with_probability(980):  # There's way too many of these
+    #     return
+
+    price = int(payload.get("base_price", 0))
+    expiration_date = datetime.fromtimestamp(
+        int(payload.get("protocol_data", {}).get("parameters", {}).get("endTime", 0)))
+    new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
+
+    embed = Embed(
+        title=f"{asset_name} has just received an offer!",
+        fields=[{"name": "Asset name", "value": f"[{asset_name}]({asset_url})", "inline": True},
+                {"name": "Offerer",
+                 "value": format_user_address_url(maker),
+                 "inline": True},
+                {"name": "Offer",
+                 "value": f"{format_wei_price(price, token_name)}",
+                 "inline": True},
+                {"name": "Expiration",
+                 "value": f"{format_datetime(expiration_date)}",
+                 "inline": True}],
+        thumbnail=image_url,
+        color=BrandColors.YELLOW)
+
+    components = Button(
+        style=ButtonStyle.GRAY,
+        label=f"Make Better Offer",
+        emoji="☝",
+        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{asset_name}")
+
+    return await channel.send("", embeds=embed, components=components)
+
+
+async def on_item_sold(payload, channel):
+    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+
+    if not asset_name:
+        return
+
+    taker = payload.get("taker", {}).get("address", "")
+    price = int(payload.get("sale_price", 0))
+    new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
+
+    embed = Embed(
+        title=f"{asset_name} has just been sold!",
+        fields=[{"name": "Asset name", "value": f"[{asset_name}]({asset_url})", "inline": True},
+                {"name": "Offerer",
+                 "value": format_user_address_url(maker),
+                 "inline": True},
+                {"name": "Buyer",
+                 "value": format_user_address_url(taker),
+                 "inline": True},
+                {"name": "Price",
+                 "value": f"{format_wei_price(price, token_name)}",
+                 "inline": True}],
+        thumbnail=image_url,
+        color=BrandColors.GREEN)
+
+    components = Button(
+        style=ButtonStyle.GRAY,
+        label=f"Make New Offer",
+        emoji="☝",
+        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{asset_name}")
+
+    return await channel.send("", embeds=embed, components=components)
+
+
+async def on_item_listed(payload, channel):
+    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+
+    if not asset_name:
+        return
+
+    price = int(payload.get("base_price", 0))
+    expiration_date = datetime.fromtimestamp(
+        int(payload.get("protocol_data", {}).get("parameters", {}).get("endTime", 0)))
+
+    embed = Embed(
+        title=f"{asset_name} has just been listed for sale!",
+        fields=[{"name": "Asset name", "value": f"[{asset_name}]({asset_url})", "inline": True},
+                {"name": "Offerer",
+                 "value": format_user_address_url(maker),
+                 "inline": True},
+                {"name": "Price",
+                 "value": f"{format_wei_price(price, token_name)}",
+                 "inline": True},
+                {"name": "Expiration",
+                 "value": f"{format_datetime(expiration_date)}",
+                 "inline": True}],
+        thumbnail=image_url,
+        color=BrandColors.BLURPLE)
+
+    components = Button(
+        style=ButtonStyle.GRAY,
+        label=f"Buy",
+        emoji="☝",
+        custom_id=f"buy_btn_{asset_name}")
+
+    return await channel.send("", embeds=embed, components=components)
+
+
+def get_opensea_callbacks(bot, web3, tx, tx_result, next_action_data):
+    return {"buy": (discord_opensea.buy_callback, (bot, web3, tx, tx_result, next_action_data)),
+            "bid": (discord_opensea.bid_callback, (bot, tx, tx_result, next_action_data)),
+            "sell": (discord_opensea.sell_callback, (bot, web3, tx, tx_result, next_action_data)),
+            "approve_opensea": (
+                discord_opensea.approve_opensea_callback, (bot, web3, tx_db, tx, tx_result, next_action_data)),
+            "approve_erc20_allowance": (
+                discord_opensea.approve_erc20_allowance_callback, (bot, web3, tx_db, tx, tx_result, next_action_data)),
+            "accept_offer": (discord_opensea.accept_offer_callback, (bot, web3, tx, tx_result, next_action_data)), }

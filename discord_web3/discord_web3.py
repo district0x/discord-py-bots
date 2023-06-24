@@ -196,3 +196,9 @@ async def link_wallet_callback(
     except Exception as e:
         logger.error(f"link_wallet_callback {str(e)}")
         raise e
+
+
+def get_web3_callbacks(bot, web3, user_address_db, tx, tx_result, json_data, next_action_data):
+    return {"link_wallet": (
+        link_wallet_callback,
+        (bot, web3, user_address_db, tx, tx_result, json_data["message"], next_action_data))}

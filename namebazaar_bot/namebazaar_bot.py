@@ -35,8 +35,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("namebazaar_bot")
 
-namebazaarGPT_token = os.getenv('NAMEBAZAAR_GPT_TOKEN')
-namebazaarGPT_client_id = os.getenv('NAMEBAZAAR_GPT_CLIENT_ID')
+namebazaar_bot_token = os.getenv('NAMEBAZAAR_BOT_TOKEN')
+namebazaar_bot_client_id = os.getenv('NAMEBAZAAR_BOT_CLIENT_ID')
 opensea_api_key = os.getenv('OPENSEA_API_KEY')
 etherscan_api_key = os.getenv('ETHERSCAN_API_KEY')
 infura_url = os.getenv('INFURA_URL')
@@ -144,24 +144,22 @@ async def get_ens_name_owner(ens_name):
     token_id = int.from_bytes(label_hash, byteorder='big')
     hex_label = hex(token_id)
 
-    query = f"""
-                    {{
-                      registration(
-                        id: "{hex_label}"
-                      ) {{
-                        registrant {{
-                          id
-                        }}
-                      }}
-                      wrappedDomain(
-                        id: "{hex_node}"
-                      ) {{
-                        owner {{
-                          id
-                        }}
-                      }}
+    query = f"""{{registration(
+                    id: "{hex_label}"
+                  ) {{
+                    registrant {{
+                      id
                     }}
-                    """
+                  }}
+                  wrappedDomain(
+                    id: "{hex_node}"
+                  ) {{
+                    owner {{
+                      id
+                    }}
+                  }}
+                }}
+                """
     response = await http_client.post(subgraph_url, json={"query": query})
     data = response.json().get('data', {})
     registration = data.get('registration')
@@ -310,6 +308,7 @@ async def offers(ctx: SlashContext, ens_name):
             ctx=ctx,
             user_address_db=user_address_db,
             tx_db=tx_db,
+            web3=web3,
             asset_contract_address=asset_contract_address,
             token_id=token_id,
             asset_name=ens_name)
@@ -702,143 +701,6 @@ async def register_callback(tx, tx_hash, next_action_data):
         raise e
 
 
-async def accept_offer_callback(tx, tx_hash, next_action_data):
-    try:
-        await wait_for_receipt(tx_hash)
-        channel = bot.get_channel(int(tx["channel"]))
-        ens_name = next_action_data["ens_name"]
-        formatted_price = next_action_data["formatted_price"]
-        ctx_author = tx["user"]
-
-        components = Button(
-            style=ButtonStyle.GRAY,
-            label=f"Make First Offer",
-            emoji="☝",
-            custom_id=f"offer_btn_0_weth_{ens_name}")
-
-        return await channel.send(
-            f"Exciting announcement! {mention(ctx_author)} has accepted the offer to sell `{ens_name}` "
-            f"for `{formatted_price}`!", components=components)
-    except Exception as e:
-        logger.error(f"Error in buy_callback {str(e)}")
-        raise e
-
-
-def get_payload_basic_info(payload):
-    asset_name = payload.get("item", {}).get("metadata", {}).get("name", "")
-    permalink = payload.get("item", {}).get("permalink", "")
-    image_url = payload.get("item", {}).get("metadata", {}).get("image_url", "")
-    token_symbol = payload.get("payment_token", {}).get("symbol", "").lower()
-    maker = payload.get("maker", {}).get("address", "")
-    return asset_name, permalink, image_url, token_symbol, maker
-
-
-async def on_item_received_bid(payload, channel):
-    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
-
-    if not asset_name:
-        return
-
-    if re.search(r"\b\d{3,100}\.eth\b", asset_name) and with_probability(980):  # There's way too many of these
-        return
-
-    price = int(payload.get("base_price", 0))
-    expiration_date = datetime.fromtimestamp(
-        int(payload.get("protocol_data", {}).get("parameters", {}).get("endTime", 0)))
-    new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
-
-    embed = Embed(
-        title=f"{asset_name} has just received an offer!",
-        fields=[{"name": "Asset name", "value": f"[{asset_name}]({asset_url})", "inline": True},
-                {"name": "Offerer",
-                 "value": format_os_user_url(maker),
-                 "inline": True},
-                {"name": "Offer",
-                 "value": f"{format_wei_price(price, token_name)}",
-                 "inline": True},
-                {"name": "Expiration",
-                 "value": f"{format_datetime(expiration_date)}",
-                 "inline": True}],
-        thumbnail=image_url,
-        color=BrandColors.YELLOW)
-
-    components = Button(
-        style=ButtonStyle.GRAY,
-        label=f"Make Better Offer",
-        emoji="☝",
-        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{asset_name}")
-
-    return await channel.send("", embeds=embed, components=components)
-
-
-async def on_item_sold(payload, channel):
-    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
-
-    if not asset_name:
-        return
-
-    taker = payload.get("taker", {}).get("address", "")
-    price = int(payload.get("sale_price", 0))
-    new_offer_price = restrict_to_multiples(safe_to_ether(price * 1.05, token_name))
-
-    embed = Embed(
-        title=f"{asset_name} has just been sold!",
-        fields=[{"name": "Asset name", "value": f"[{asset_name}]({asset_url})", "inline": True},
-                {"name": "Offerer",
-                 "value": format_os_user_url(maker),
-                 "inline": True},
-                {"name": "Buyer",
-                 "value": format_os_user_url(taker),
-                 "inline": True},
-                {"name": "Price",
-                 "value": f"{format_wei_price(price, token_name)}",
-                 "inline": True}],
-        thumbnail=image_url,
-        color=BrandColors.GREEN)
-
-    components = Button(
-        style=ButtonStyle.GRAY,
-        label=f"Make New Offer",
-        emoji="☝",
-        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{asset_name}")
-
-    return await channel.send("", embeds=embed, components=components)
-
-
-async def on_item_listed(payload, channel):
-    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
-
-    if not asset_name:
-        return
-
-    price = int(payload.get("base_price", 0))
-    expiration_date = datetime.fromtimestamp(
-        int(payload.get("protocol_data", {}).get("parameters", {}).get("endTime", 0)))
-
-    embed = Embed(
-        title=f"{asset_name} has just been listed for sale!",
-        fields=[{"name": "Asset name", "value": f"[{asset_name}]({asset_url})", "inline": True},
-                {"name": "Offerer",
-                 "value": format_os_user_url(maker),
-                 "inline": True},
-                {"name": "Price",
-                 "value": f"{format_wei_price(price, token_name)}",
-                 "inline": True},
-                {"name": "Expiration",
-                 "value": f"{format_datetime(expiration_date)}",
-                 "inline": True}],
-        thumbnail=image_url,
-        color=BrandColors.BLURPLE)
-
-    components = Button(
-        style=ButtonStyle.GRAY,
-        label=f"Buy",
-        emoji="☝",
-        custom_id=f"buy_btn_{asset_name}")
-
-    return await channel.send("", embeds=embed, components=components)
-
-
 app = Quart(__name__)
 app = cors(app, allow_origin="*")  # reconsider this in prod
 
@@ -861,24 +723,24 @@ async def user_post():
 
     next_action_data = json.loads(tx["next_action_data"])
 
-    if tx["action"] == "commit":
-        asyncio.create_task(commit_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "register":
-        asyncio.create_task(register_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "buy":
-        asyncio.create_task(buy_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "bid":
-        asyncio.create_task(bid_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "sell":
-        asyncio.create_task(sell_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "approve_opensea":
-        asyncio.create_task(approve_opensea_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "approve_erc20_allowance":
-        asyncio.create_task(approve_erc20_allowance_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "accept_offer":
-        asyncio.create_task(accept_offer_callback(tx, tx_result, next_action_data))
-    elif tx["action"] == "link_wallet":
-        asyncio.create_task(link_wallet_callback(tx, tx_result, json_data["message"], next_action_data))
+    callbacks = {
+        "commit": (commit_callback, (tx, tx_result, next_action_data)),
+        "register": (register_callback, (tx, tx_result, next_action_data))
+    }
+
+    web3_callbacks = discord_web3.get_web3_callbacks(
+        bot, web3, user_address_db, tx, tx_result, json_data, next_action_data)
+    opensea_callbacks = discord_opensea.get_opensea_callbacks(bot, web3, tx, tx_result, next_action_data)
+
+    merged_callbacks = {**callbacks, **web3_callbacks, **opensea_callbacks}
+
+    callback_data = merged_callbacks.get(tx["action"])
+
+    if callback_data is None:
+        abort(400, description='Invalid Action')
+
+    callback, args = callback_data
+    asyncio.create_task(callback(*args))
 
     return jsonify({"status": "success"})
 
@@ -887,7 +749,7 @@ async def main():
     nest_asyncio.apply()
     tasks = [
         asyncio.create_task(app.run_task(host="0.0.0.0", port="80")),
-        asyncio.create_task(bot.start(namebazaarGPT_token))
+        asyncio.create_task(bot.start(namebazaar_bot_token))
     ]
     await asyncio.gather(*tasks)
 
