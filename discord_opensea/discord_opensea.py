@@ -1,32 +1,34 @@
 import logging
 from interactions import SlashContext
 from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
+from interactions.ext.paginators import Paginator
 import httpx
 from discord_utils.discord_utils import truncate_string, format_time_remaining, format_datetime, mention
 from discord_web3.discord_web3 import safe_to_wei, safe_to_ether, get_usd_price, tx_link_instruction_text, \
     get_tx_page_url, compress_string_to_url, generate_tx_key, format_wei_price, format_eth_price, get_contract
 import discord_web3.discord_web3 as discord_web3
+from functools import partial
 from decimal import Decimal, ROUND_DOWN
 from db.tx_db import TxDB
 from db.user_address_db import UserAddressDB
 from web3 import Web3
 from enum import Enum
 from datetime import datetime, timedelta
+import websockets
+import json
+import asyncio
+import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discord_opensea")
 http_client = httpx.AsyncClient()
+api_key = None
+stream_interval = 1
 
 opensea_urls = {
     "listings": "https://api.opensea.io/v2/orders/ethereum/seaport/listings",
     "fulfillment": "https://api.opensea.io/v2/listings/fulfillment_data",
     "offers": "https://api.opensea.io/v2/orders/ethereum/seaport/offers"
-}
-
-os_api_headers = {
-    "accept": "application/json",
-    "X-API-KEY": opensea_api_key,
-    "content-type": "application/json"
 }
 
 contract_addresses = {
@@ -50,6 +52,21 @@ class AssetType(Enum):
     ERC1155 = 3
     ERC721_WITH_CRITERIA = 4
     ERC1155_WITH_CRITERIA = 5
+
+
+class AssetTypeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, AssetType):
+            return obj.value
+        return super().default(obj)
+
+
+def get_os_api_headers():
+    return {
+        "accept": "application/json",
+        "X-API-KEY": api_key,
+        "content-type": "application/json"
+    }
 
 
 def get_asset_url(asset_contract_address, token_id):
@@ -123,33 +140,28 @@ def get_token_contract(web3, token_address):
     token_name = token_mapping.get(token_address.lower(), None)
 
     if token_name:
-        token_name.lower(), get_contract(web3, token_address, token_name)
+        return token_name.lower(), get_contract(web3, token_address, token_name)
     else:
         return ("eth", None)
 
 
 def get_button_id(asset_name, token_id):
-    if len(token_id > 50) and asset_name is not None:
+    if len(str(token_id)) > 50 and asset_name is not None:
         return asset_name
     else:
         token_id
 
 
 def get_token_address(token_name):
-    token_mapping = {
-        "eth": "0x0000000000000000000000000000000000000000",
-        "usdc": usdc.address,
-        "weth": weth.address,
-        "dai": dai.address
-    }
-    return token_mapping[token_name]
+    return contract_addresses.get(token_name.upper(), "0x0000000000000000000000000000000000000000")
 
 
-def get_tx_data_from_fulfillment(fulfillment, order_type):
+def get_tx_data_from_fulfillment(web3, fulfillment, order_type):
     fn_signature = fulfillment["fulfillment_data"]["transaction"]["function"]
     fn_name = fn_signature.split("(")[0]
     tx_value = int(fulfillment["fulfillment_data"]["transaction"]["value"])
     tx_to = Web3.to_checksum_address(fulfillment["fulfillment_data"]["transaction"]["to"])
+    seaport = get_contract(web3, contract_addresses["Seaport"], "Seaport")
     if order_type == "basic":
         parameters = fulfillment["fulfillment_data"]["transaction"]["input_data"]["parameters"]
         args = prepare_tx_args(parameters)
@@ -170,7 +182,7 @@ async def get_highest_bid(asset_contract_address, token_id):
           f"order_direction=desc&" \
           f"limit=1"
 
-    response = await http_client.get(url, headers=os_api_headers)
+    response = await http_client.get(url, headers=get_os_api_headers())
     offers = response.json()
 
     if "orders" in offers and len(offers["orders"]) > 0:  # Have some bids in the auction
@@ -187,7 +199,7 @@ async def get_offers(asset_contract_address, token_id):
           f"order_direction=desc&" \
           f"limit=5"
 
-    response = await http_client.get(url, headers=os_api_headers)
+    response = await http_client.get(url, headers=get_os_api_headers())
     return response.json()
 
 
@@ -199,7 +211,7 @@ async def get_cheapest_listing(asset_contract_address, token_id):
           f"order_direction=asc&" \
           f"limit=1"
 
-    response = await http_client.get(url, headers=os_api_headers)
+    response = await http_client.get(url, headers=get_os_api_headers())
 
     listings = response.json()
 
@@ -223,7 +235,7 @@ async def get_fulfillment(order_hash, protocol_address, user_address):
         }
     }
 
-    response = await http_client.post(url, json=payload, headers=os_api_headers)
+    response = await http_client.post(url, json=payload, headers=get_os_api_headers())
     return response.json()
 
 
@@ -349,7 +361,16 @@ def get_order_parameters(offerer, offer_item_type, offer_token, offer_token_id, 
     }
 
 
-async def start_stream(bot, api_key, channel_id):
+async def handle_stream_event(event_name, payload, handler, filters, channel):
+    if event_name in filters:
+        is_allowed = filters[event_name](payload)
+        if is_allowed:
+            await handler(payload, channel)
+    else:
+        await handler(payload, channel)
+
+
+async def start_stream(bot, channel_id, filters={}):
     try:
         logger.info("Starting OpenSea Stream")
         channel = bot.get_channel(channel_id)
@@ -369,20 +390,21 @@ async def start_stream(bot, api_key, channel_id):
                 event = response["event"]
                 payload = response.get("payload", {}).get("payload", {})
                 if event == "item_received_bid":
-                    await on_item_received_bid(payload, channel)
+                    await handle_stream_event("item_received_bid", payload, on_item_received_bid, filters, channel)
                 elif event == "item_sold":
-                    await on_item_sold(payload, channel)
-                elif event == "item_listed" and with_probability(750):
-                    await on_item_listed(payload, channel)
+                    await handle_stream_event("item_sold", payload, on_item_sold, filters, channel)
+                elif event == "item_listed":
+                    await handle_stream_event("item_listed", payload, on_item_listed, filters, channel)
                 await asyncio.sleep(stream_interval)
     except Exception as e:
         logger.error(f"Error in start_stream, will restart: {e}")
-        await start_stream()
+        await start_stream(bot, channel_id, filters)
 
 
 async def approve_erc20_allowance(
         ctx: SlashContext, tx_db: TxDB, asset_name, user_address, price, allowance, token_name, token_contract,
-        token_id, next_tx_to, next_tx_data, next_tx_value, is_bid, highest_bid, expiration_time, asset_url, asset_img):
+        token_id, next_tx_to, next_tx_data, next_tx_value, is_bid, highest_bid, expiration_time, asset_url,
+        asset_img=None):
     try:
         tx_key = generate_tx_key()
 
@@ -405,7 +427,7 @@ async def approve_erc20_allowance(
                   "next_tx_from": user_address,
                   "next_tx_data": next_tx_data,
                   "next_tx_value": next_tx_value})})
-        tx_data = token_contract.encodeABI(fn_name="approve", args=[opensea_conduit.address, price])
+        tx_data = token_contract.encodeABI(fn_name="approve", args=[contract_addresses["OpenSeaConduit"], price])
 
         tx = {
             "to": token_contract.address,
@@ -529,9 +551,9 @@ async def send_buy_tx_url(
 
 async def buy(
         ctx, web3, user_address_db: UserAddressDB, tx_db: TxDB, token_id, asset_type: AssetType, asset_name,
-        bid=None, currency=None, force_bid=False):
+        asset_contract_address, bid=None, currency=None, force_bid=False):
     try:
-        eth_usd_price = await get_eth_usd_price()
+        eth_usd_price = await discord_web3.get_eth_usd_price()
         bid_wei = None
         highest_bid = None
         is_bid = False
@@ -587,7 +609,7 @@ async def buy(
             expiration_time = int((datetime.now() + timedelta(days=100)).timestamp())
 
         if user_address.lower() == offerer.lower():
-            return await ctx.send(f"It seems that your linked Ethereum address has listed `{cured_name}` on OpenSea.",
+            return await ctx.send(f"It seems that your linked Ethereum address has listed `{asset_name}` on OpenSea.",
                                   ephemeral=True)
 
         if bid is None and cheapest_listing:
@@ -613,7 +635,7 @@ async def buy(
                 bid_wei = safe_to_wei(bid, cons_token_name)
 
         if not bid_wei and (order_type == "basic" or order_type == "dutch"):
-            tx_data, tx_value, tx_to = get_tx_data_from_fulfillment(fulfillment, order_type)
+            tx_data, tx_value, tx_to = get_tx_data_from_fulfillment(web3, fulfillment, order_type)
         elif bid_wei or order_type == "english":
             is_bid = True
             highest_bid, _ = await get_highest_bid(asset_contract_address, token_id)
@@ -629,35 +651,36 @@ async def buy(
             (_, _, os_fee_start_price, _) = get_order_prices(current_price, unit="wei")
             order_params = get_order_parameters(
                 offerer=user_address,
-                offer_asset_type=1,
+                offer_item_type=AssetType.ERC20,
                 offer_token=cons_token,
                 offer_token_id=0,
                 offer_start_amount=current_price,
                 offer_end_amount=current_price,
-                cons_asset_type=asset_type,
+                cons_item_type=asset_type,
                 cons_token=asset_contract_address,
                 cons_token_id=token_id,
                 cons_start_amount=1,
                 cons_end_amount=1,
                 cons_recepient=user_address,
-                os_cons_asset_type=1,
+                os_cons_item_type=AssetType.ERC20,
                 os_cons_token=cons_token,
                 os_cons_start_amount=os_fee_start_price,
                 os_cons_end_amount=os_fee_start_price,
                 start_time=int(datetime.now().timestamp()),
                 end_time=int(expiration_time) + 604800,  # + 1 week
                 order_type=0)
-            tx_data = json.dumps(order_params)
+            tx_data = json.dumps(order_params, cls=AssetTypeEncoder)
             tx_value = 0
 
         if cons_token_name != "eth":
-            allowance = int(cons_token_contract.functions.allowance(user_address, opensea_conduit.address).call())
+            allowance = int(
+                cons_token_contract.functions.allowance(user_address, contract_addresses["OpenSeaConduit"]).call())
 
             if allowance < current_price:
                 return await approve_erc20_allowance(
                     ctx=ctx,
                     tx_db=tx_db,
-                    asset_name=cured_name,
+                    asset_name=asset_name,
                     user_address=user_address,
                     price=current_price,
                     allowance=allowance,
@@ -676,7 +699,7 @@ async def buy(
             ctx=ctx,
             web3=web3,
             tx_db=tx_db,
-            asset_name=cured_name,
+            asset_name=asset_name,
             price=current_price,
             is_bid=is_bid,
             token_name=cons_token_name,
@@ -698,10 +721,10 @@ async def buy(
         raise e
 
 
-async def on_accept_offer_btn(ctx, tx_db: TxDB, paginator, offers):
+async def on_accept_offer_btn(ctx, tx_db: TxDB, web3, paginator, offers):
     offer = offers[paginator.page_index]
     fulfillment = await get_fulfillment(offer["order_hash"], offer["protocol_address"], offer["user_address"])
-    tx_data, tx_value, tx_to = get_tx_data_from_fulfillment(fulfillment, offer["order_type"])
+    tx_data, tx_value, tx_to = get_tx_data_from_fulfillment(web3, fulfillment, offer["order_type"])
 
     tx = {
         "to": tx_to,
@@ -724,15 +747,15 @@ async def on_accept_offer_btn(ctx, tx_db: TxDB, paginator, offers):
         description=f"In order to accept this offer, {tx_link_instruction_text}",
         fields=offer["fields"],
         color=BrandColors.GREEN,
-        thumbnail=offer['asset_img'],
+        thumbnail=offer.get("asset_img", ""),
         url=tx_url)
 
     return await ctx.send(f"You're about to accept the following offer for your NFT:", embeds=embed, ephemeral=True)
 
 
 async def offers(
-        ctx: SlashContext, user_address_db: UserAddressDB, tx_db: TxDB, web3, asset_contract_address, token_id,
-        asset_name):
+        bot, ctx: SlashContext, user_address_db: UserAddressDB, tx_db: TxDB, web3, asset_contract_address, token_id,
+        asset_name, asset_owner):
     try:
         user_address = user_address_db.get_address(ctx.author_id)
 
@@ -752,7 +775,7 @@ async def offers(
             offer_token_name, _ = get_token_contract(web3, offer_token)
             price = int(offer["current_price"])
             maker_img_url = offer.get("maker", {}).get("profile_img_url", "")
-            eth_usd_price = await get_eth_usd_price()
+            eth_usd_price = await discord_web3.get_eth_usd_price()
             usd_price = get_usd_price(safe_to_ether(price, offer_token_name), eth_usd_price, offer_token_name)
             formatted_price = format_wei_price(price, offer_token_name)
 
@@ -783,12 +806,11 @@ async def offers(
         paginator = Paginator.create_from_embeds(bot, *embeds)
         paginator.default_button_color = ButtonStyle.GRAY
 
-        owner, _, _ = await get_name_owner(cured_name)
-
-        if owner.lower() == user_address.lower():
+        if asset_owner.lower() == user_address.lower():
             paginator.show_callback_button = True
 
-        paginator.callback = partial(on_accept_offer_btn, tx_db=tx_db, paginator=paginator, offers=offers_data)
+        paginator.callback = partial(on_accept_offer_btn, web3=web3, tx_db=tx_db, paginator=paginator,
+                                     offers=offers_data)
         return await paginator.send(ctx)
 
     except Exception as e:
@@ -885,10 +907,8 @@ async def sell(ctx: SlashContext, user_address_db: UserAddressDB, tx_db: TxDB, a
             asset_contract_address=asset_contract.address,
             ctx_author_id=ctx.author_id,
             ctx_channel_id=ctx.channel_id)
-    except DisallowedNameError as e:
-        await send_invalid_name_msg(ctx, asset_name)
     except Exception as e:
-        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the selling of `{cured_name}`.",
+        await ctx.send(f"I'm sorry, but an error occurred while trying to initiate the selling of `{asset_name}`.",
                        ephemeral=True)
         logger.error(f"Sell command exception {str(e)}")
         raise e
@@ -923,7 +943,7 @@ async def send_sell_sign_url(
         end_time=end_time,
         order_type=1)
 
-    order_params_json = json.dumps(order_params)
+    order_params_json = json.dumps(order_params, cls=AssetTypeEncoder)
 
     tx = {
         "to": contract_addresses["Seaport"],
@@ -973,7 +993,7 @@ async def bid_callback(bot, tx, tx_signature, next_action_data):
             "protocol_address": contract_addresses["Seaport"]
         }
 
-        response = await http_client.post(opensea_urls["offers"], json=order_params, headers=os_api_headers)
+        response = await http_client.post(opensea_urls["offers"], json=order_params, headers=get_os_api_headers())
         response = response.json()
 
         if "errors" in response:
@@ -1006,7 +1026,7 @@ async def bid_callback(bot, tx, tx_signature, next_action_data):
 
 async def buy_callback(bot, web3, tx, tx_hash, next_action_data):
     try:
-        await discord_web3.wait_for_receipt(tx_hash)
+        await discord_web3.wait_for_receipt(web3, tx_hash)
         channel = bot.get_channel(int(tx["channel"]))
         asset_name = next_action_data["asset_name"]
         token_id = next_action_data["token_id"]
@@ -1042,7 +1062,7 @@ async def sell_callback(bot, web3, tx, tx_signature, next_action_data):
 
         (cons_token_name, _) = get_token_contract(web3, next_action_data["consideration"][0]["token"])
 
-        response = await http_client.post(opensea_urls['listings'], json=order_params, headers=os_api_headers)
+        response = await http_client.post(opensea_urls['listings'], json=order_params, headers=get_os_api_headers())
         response = response.json()
 
         if "errors" in response:
@@ -1179,9 +1199,6 @@ async def on_item_received_bid(payload, channel):
     if not asset_name:
         return
 
-    # if re.search(r"\b\d{3,100}\.eth\b", asset_name) and with_probability(980):  # There's way too many of these
-    #     return
-
     price = int(payload.get("base_price", 0))
     expiration_date = datetime.fromtimestamp(
         int(payload.get("protocol_data", {}).get("parameters", {}).get("endTime", 0)))
@@ -1279,12 +1296,12 @@ async def on_item_listed(payload, channel):
     return await channel.send("", embeds=embed, components=components)
 
 
-def get_opensea_callbacks(bot, web3, tx, tx_result, next_action_data):
-    return {"buy": (discord_opensea.buy_callback, (bot, web3, tx, tx_result, next_action_data)),
-            "bid": (discord_opensea.bid_callback, (bot, tx, tx_result, next_action_data)),
-            "sell": (discord_opensea.sell_callback, (bot, web3, tx, tx_result, next_action_data)),
-            "approve_opensea": (
-                discord_opensea.approve_opensea_callback, (bot, web3, tx_db, tx, tx_result, next_action_data)),
-            "approve_erc20_allowance": (
-                discord_opensea.approve_erc20_allowance_callback, (bot, web3, tx_db, tx, tx_result, next_action_data)),
-            "accept_offer": (discord_opensea.accept_offer_callback, (bot, web3, tx, tx_result, next_action_data)), }
+def get_opensea_callbacks(bot, web3, tx_db, tx, tx_result, next_action_data):
+    return {
+        "buy": (buy_callback, (bot, web3, tx, tx_result, next_action_data)),
+        "bid": (bid_callback, (bot, tx, tx_result, next_action_data)),
+        "sell": (sell_callback, (bot, web3, tx, tx_result, next_action_data)),
+        "approve_opensea": (approve_opensea_callback, (bot, web3, tx_db, tx, tx_result, next_action_data)),
+        "approve_erc20_allowance": (
+            approve_erc20_allowance_callback, (bot, web3, tx_db, tx, tx_result, next_action_data)),
+        "accept_offer": (accept_offer_callback, (bot, web3, tx, tx_result, next_action_data)), }

@@ -6,13 +6,11 @@ import logging
 import os
 import re
 import websockets
-from functools import partial
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
 from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, \
     component_callback, ComponentContext, auto_defer
 from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
-from interactions.ext.paginators import Paginator
 from web3 import Web3
 from eth_account.messages import encode_defunct, _hash_eip191_message
 from decimal import Decimal, ROUND_DOWN
@@ -26,8 +24,8 @@ import httpx_cache
 import discord_opensea.discord_opensea as discord_opensea
 import discord_web3.discord_web3 as discord_web3
 import discord_utils.discord_utils as discord_utils
-from discord_utils.discord_utils import mention
-from discord_web3.discord_web3 import get_contract
+from discord_utils.discord_utils import mention, with_probability
+from discord_web3.discord_web3 import get_contract, get_tx_page_url
 from discord_opensea.discord_opensea import AssetType
 
 load_dotenv()
@@ -37,17 +35,15 @@ logger = logging.getLogger("namebazaar_bot")
 
 namebazaar_bot_token = os.getenv('NAMEBAZAAR_BOT_TOKEN')
 namebazaar_bot_client_id = os.getenv('NAMEBAZAAR_BOT_CLIENT_ID')
-opensea_api_key = os.getenv('OPENSEA_API_KEY')
-etherscan_api_key = os.getenv('ETHERSCAN_API_KEY')
+discord_opensea.api_key = os.getenv('OPENSEA_API_KEY')
+discord_web3.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY')
 infura_url = os.getenv('INFURA_URL')
-web3_network = os.getenv('WEB3_NETWORK')
-tx_page_url = os.getenv('TX_PAGE_URL')
-server_host = os.getenv('SERVER_HOST')
-server_port = os.getenv('SERVER_PORT')
-tx_check_interval = int(os.getenv('TX_CHECK_INTERVAL'))
+discord_web3.tx_page_url = os.getenv('TX_PAGE_URL')
+discord_web3.server_host = os.getenv('SERVER_HOST')
+discord_web3.server_port = os.getenv('SERVER_PORT')
+discord_web3.tx_check_interval = int(os.getenv('TX_CHECK_INTERVAL'))
 stream_channel_id = int(os.getenv('STREAM_CHANNEL_ID'))
-stream_interval = int(os.getenv('STREAM_INTERVAL'))
-eth_price_cache_expire = 300  # seconds
+discord_opensea.stream_interval = int(os.getenv('STREAM_INTERVAL'))
 db_path = os.getenv('SQLITE_DB_PATH')
 
 contract_addresses = {  # Make sure addresses are checksum format
@@ -95,9 +91,6 @@ def is_top_level_eth(ens_name):
 
     return False
 
-
-web3.eth.contract(address=get_contract_address("ETHRegistrarController"),
-                  abi=get_abi("ETHRegistrarController"))
 
 web3 = discord_web3.get_ws_web3(infura_url)
 
@@ -182,11 +175,23 @@ async def send_invalid_name_msg(ctx, ens_name):
     return await ctx.send(f"I apologize, but the name `{ens_name}` is not a valid ENS name.", ephemeral=True)
 
 
+def item_received_bid_filter(payload):
+    asset_name = payload.get("item", {}).get("metadata", {}).get("name", "")
+    if re.search(r"\b\d{3,100}\.eth\b", asset_name) and with_probability(980):  # There's way too many of these
+        return False
+    return True
+
+
+def item_listed_filter(payload):
+    return with_probability(750)
+
+
 @listen()
 async def on_ready():
     # ready events pass no data, so dont have params
     logger.info("NamebazaarBot is ready")
-    await discord_opensea.start_stream(bot, opensea_api_key, stream_channel_id)
+    await discord_opensea.start_stream(bot, stream_channel_id, {"item_received_bid": item_received_bid_filter,
+                                                                "item_listed": item_listed_filter})
 
 
 @slash_command(name="buy", description="Buy ENS name from OpenSea")
@@ -213,7 +218,7 @@ async def on_ready():
     choices=discord_opensea.currency_choices)
 async def buy(ctx: SlashContext, ens_name, bid=None, currency=None):
     try:
-        asset_name = add_eth_suffix(asset_name)
+        asset_name = add_eth_suffix(ens_name)
         cured_name = cure_emoji_name(ens_cure(asset_name))
 
         if not is_top_level_eth(cured_name):
@@ -229,6 +234,7 @@ async def buy(ctx: SlashContext, ens_name, bid=None, currency=None):
             user_address_db=user_address_db,
             tx_db=tx_db,
             asset_name=cured_name,
+            asset_contract_address=asset_contract_address,
             token_id=token_id,
             asset_type=AssetType.ERC1155 if is_wrapped else AssetType.ERC721,
             bid=bid,
@@ -251,9 +257,8 @@ async def buy_btn_callback(ctx: ComponentContext):
         tx_db=tx_db,
         asset_name=ens_name,
         token_id=token_id,
-        asset_type=AssetType.ERC1155 if is_wrapped else AssetType.ERC721,
-        bid=bid,
-        currency=currency)
+        asset_contract_address=asset_contract_address,
+        asset_type=AssetType.ERC1155 if is_wrapped else AssetType.ERC721)
 
 
 @component_callback(re.compile(r"^offer_btn_"))
@@ -275,6 +280,7 @@ async def offer_btn_callback(ctx: ComponentContext):
             tx_db=tx_db,
             asset_name=ens_name,
             token_id=token_id,
+            asset_contract_address=asset_contract_address,
             asset_type=AssetType.ERC1155 if is_wrapped else AssetType.ERC721,
             bid=price,
             currency=token_name,
@@ -303,15 +309,18 @@ async def offers(ctx: SlashContext, ens_name):
             return
 
         asset_contract_address, token_id, is_wrapped = get_ens_token(cured_name)
+        owner, _, _ = await get_ens_name_owner(ens_name)
 
         return await discord_opensea.offers(
+            bot=bot,
             ctx=ctx,
             user_address_db=user_address_db,
             tx_db=tx_db,
             web3=web3,
             asset_contract_address=asset_contract_address,
             token_id=token_id,
-            asset_name=ens_name)
+            asset_name=ens_name,
+            asset_owner=owner)
     except DisallowedNameError as e:
         return await send_invalid_name_msg(ctx, ens_name)
 
@@ -372,6 +381,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
                                   ephemeral=True)
 
         owner, token_id, is_wrapped = await get_ens_name_owner(cured_name)
+        user_address = user_address_db.get_address(ctx.author_id)
 
         if owner is None or owner.lower() != user_address.lower():
             await ctx.send(f"It appears that you don't own `{cured_name}`.", ephemeral=True)
@@ -582,11 +592,13 @@ async def register(ctx: SlashContext, ens_name):
                       "user": ctx.author_id,
                       "action": "commit",
                       "channel": ctx.channel_id,
-                      "next_action_data": json.dumps({"name_label": name_label,
-                                                      "owner_address": user_address,
-                                                      "register_duration": register_duration,
-                                                      "salt_hex": salt_bytes.hex(),
-                                                      "set_addr_data": set_addr_data})})
+                      "next_action_data":
+                          json.dumps(
+                              {"name_label": name_label,
+                               "owner_address": user_address,
+                               "register_duration": register_duration,
+                               "salt_hex": salt_bytes.hex(),
+                               "set_addr_data": set_addr_data})})
 
         embed = Embed(
             title=f"Begin Registration for `{cured_name}`",
@@ -730,7 +742,7 @@ async def user_post():
 
     web3_callbacks = discord_web3.get_web3_callbacks(
         bot, web3, user_address_db, tx, tx_result, json_data, next_action_data)
-    opensea_callbacks = discord_opensea.get_opensea_callbacks(bot, web3, tx, tx_result, next_action_data)
+    opensea_callbacks = discord_opensea.get_opensea_callbacks(bot, web3, tx_db, tx, tx_result, next_action_data)
 
     merged_callbacks = {**callbacks, **web3_callbacks, **opensea_callbacks}
 

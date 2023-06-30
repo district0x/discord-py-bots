@@ -10,11 +10,21 @@ from db.tx_db import TxDB
 from db.user_address_db import UserAddressDB
 from datetime import datetime, timedelta
 from eth_account.messages import encode_defunct, _hash_eip191_message
+from interactions import SlashContext, Embed, BrandColors
+import json
+import random
+import asyncio
 
 http_cache_client = httpx_cache.AsyncClient()
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discord_web3")
+etherscan_api_key = None
+tx_check_interval = 3
+eth_price_cache_expire = 300  # seconds
+tx_page_url = "http://localhost:8000/"
+server_host = "localhost"
+server_port = 80
 
 tx_link_instruction_text = f"please click on the link above. Upon clicking, the URL will open in your browser, " \
                            f"automatically launching your MetaMask browser extension or the mobile app. " \
@@ -26,7 +36,7 @@ contract_addresses = {
 
 
 def get_ws_web3(url):
-    return Web3(Web3.WebsocketProvider(infura_url))
+    return Web3(Web3.WebsocketProvider(url))
 
 
 def get_contract(web3, address, abi_name):
@@ -107,7 +117,7 @@ def safe_to_ether(amount, token_name):
     return Web3.from_wei(amount, "ether")
 
 
-async def get_eth_usd_price(etherscan_api_key):
+async def get_eth_usd_price():
     response = await http_cache_client.get(
         f"https://api.etherscan.io/api?module=stats&action=ethprice&apikey={etherscan_api_key}",
         headers={"cache-control": f"max-age={eth_price_cache_expire}"})
@@ -201,4 +211,4 @@ async def link_wallet_callback(
 def get_web3_callbacks(bot, web3, user_address_db, tx, tx_result, json_data, next_action_data):
     return {"link_wallet": (
         link_wallet_callback,
-        (bot, web3, user_address_db, tx, tx_result, json_data["message"], next_action_data))}
+        (bot, web3, user_address_db, tx, tx_result, json_data.get("message", ""), next_action_data))}
