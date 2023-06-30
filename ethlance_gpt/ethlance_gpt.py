@@ -77,7 +77,7 @@ If you would like to delete your current post, you can inform me using a similar
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ethlanceGPT")
+logger = logging.getLogger("ethlance_gpt")
 
 load_dotenv()
 # Get the value of environment variables
