@@ -4,6 +4,7 @@ WORKDIR /usr/src/app
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir -r requirements.txt
 COPY . . 
-WORKDIR /usr/src/app/namebazaarBot
+COPY namebazaar_bot/namebazaar_bot.py namebazaar_bot.py
+COPY abi /usr/src/abi
 EXPOSE 80
-CMD [ "python3", "namebazaarBot.py" ]
+CMD [ "python3", "namebazaar_bot.py" ]
