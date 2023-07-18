@@ -1,18 +1,14 @@
 import asyncio
-import binascii
-from datetime import datetime, timedelta
 import json
 import logging
 import os
 import re
-import websockets
 from dotenv import load_dotenv
 from ens_normalize import ens_cure, DisallowedNameError
 from interactions import listen, Client, Intents, slash_command, slash_option, SlashContext, OptionType, \
     component_callback, ComponentContext, auto_defer
 from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
 from web3 import Web3
-from eth_account.messages import encode_defunct, _hash_eip191_message
 from decimal import Decimal, ROUND_DOWN
 from quart import Quart, request, jsonify, abort
 import nest_asyncio
@@ -20,7 +16,6 @@ from db.tx_db import TxDB
 from db.user_address_db import UserAddressDB
 from quart_cors import cors
 import httpx
-import httpx_cache
 import discord_opensea.discord_opensea as discord_opensea
 import discord_web3.discord_web3 as discord_web3
 import discord_utils.discord_utils as discord_utils
@@ -114,7 +109,6 @@ def cure_emoji_name(ens_name):
 
 
 http_client = httpx.AsyncClient()
-http_cache_client = httpx_cache.AsyncClient()
 
 
 def get_ens_token(ens_name):
@@ -190,8 +184,8 @@ def item_listed_filter(payload):
 async def on_ready():
     # ready events pass no data, so dont have params
     logger.info("NamebazaarBot is ready")
-    await discord_opensea.start_stream(bot, stream_channel_id, {"item_received_bid": item_received_bid_filter,
-                                                                "item_listed": item_listed_filter})
+    await discord_opensea.start_stream(bot, "ens", stream_channel_id, {"item_received_bid": item_received_bid_filter,
+                                                                       "item_listed": item_listed_filter})
 
 
 @slash_command(name="buy", description="Buy ENS name from OpenSea")
@@ -394,7 +388,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
             user_address_db=user_address_db,
             tx_db=tx_db,
             asset_name=cured_name,
-            asset_type=AssetType.ERC1155 if is_wrapped else AssetType.ERC721,
+            asset_type=AssetType.ERC721,
             asset_contract=asset_contract,
             token_id=token_id,
             currency=currency,

@@ -10,6 +10,9 @@ def format_datetime(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_datetime(date_str):
+    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S.%f")
+
 def truncate_string(text, max_length):
     if len(text) <= max_length:
         return text

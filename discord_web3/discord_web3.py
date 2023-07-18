@@ -4,6 +4,7 @@ import hashlib
 import zlib
 import base64
 import urllib.parse
+import httpx
 import httpx_cache
 from decimal import Decimal, ROUND_DOWN
 from db.tx_db import TxDB
@@ -16,6 +17,7 @@ import random
 import asyncio
 
 http_cache_client = httpx_cache.AsyncClient()
+http_client = httpx.AsyncClient()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discord_web3")
@@ -124,6 +126,34 @@ async def get_eth_usd_price():
 
     response = response.json()
     return Decimal(response["result"]["ethusd"])
+
+
+async def get_owned_nfts(asset_contract_address, user_address, page=0, offset=0):
+    response = await http_client.get(
+        f"https://api.etherscan.io/api"
+        f"?module=account"
+        f"&action=addresstokennftinventory"
+        f"&address={user_address.lower()}"
+        f"&contractaddress={asset_contract_address.lower()}"
+        f"&page={page}"
+        f"&offset={offset}"
+        f"&apikey={etherscan_api_key}")
+
+    response = response.json()
+
+    return response["result"]
+
+
+def get_token_of_owner(asset_contract, owner, index):
+    return asset_contract.functions.tokenOfOwnerByIndex(owner, index).call()
+
+
+def get_balance_of(asset_contract, owner):
+    return asset_contract.functions.balanceOf(owner).call()
+
+
+def get_nft_owner(asset_contract, token_id):
+    return asset_contract.functions.ownerOf(token_id).call()
 
 
 def get_usd_price(amount, eth_usd_price, token_name):
