@@ -132,3 +132,4 @@ dmypy.json
 /Scripts/
 /pyvenv.cfg
 /namebazaar_bot/nb.db
+/memefactory_bot/nb.db

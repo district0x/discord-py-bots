@@ -3,7 +3,7 @@ from interactions import SlashContext
 from interactions.models.discord import Embed, BrandColors, ButtonStyle, Button
 from interactions.ext.paginators import Paginator, Page
 import httpx
-from discord_utils.discord_utils import truncate_string, format_time_remaining, format_datetime, mention, parse_datetime
+from discord_utils.discord_utils import truncate, format_time_remaining, format_datetime, mention, parse_datetime
 from discord_web3.discord_web3 import safe_to_wei, safe_to_ether, get_usd_price, tx_link_instruction_text, \
     get_tx_page_url, compress_string_to_url, generate_tx_key, format_wei_price, format_eth_price, get_contract
 import discord_web3.discord_web3 as discord_web3
@@ -71,8 +71,10 @@ class NFTPage(Page):
 
     async def to_embed(self) -> Embed:
         response = await get_ntf(self.chain, self.contract_address, self.token_id)
+        listings_len = await get_listings_len(self.contract_address, self.token_id)
+        offers_len = await get_offers_len(self.contract_address, self.token_id)
         nft = response["nft"]
-        return embed_nft(self.contract_address, nft)
+        return embed_nft(self.contract_address, nft, listings_len, offers_len)
 
 
 @attrs.define(eq=False, order=False, hash=False, kw_only=False)
@@ -85,9 +87,11 @@ class OwnedNFTPage(Page):
     async def to_embed(self) -> Embed:
         token_id = discord_web3.get_token_of_owner(self.asset_contract, self.owner, self.index)
         response = await get_ntf(self.chain, self.asset_contract.address, token_id)
+        listings_len = await get_listings_len(self.asset_contract.address, token_id)
+        offers_len = await get_offers_len(self.asset_contract.address, token_id)
         nft = response["nft"]
 
-        return embed_nft(self.asset_contract.address, nft)
+        return embed_nft(self.asset_contract.address, nft, listings_len, offers_len)
 
 
 def get_os_api_headers():
@@ -111,7 +115,7 @@ def get_user_url(address):
 
 
 def format_user_address_url(address):
-    return f"[{truncate_string(address, 10)}]({get_user_url(address)})"
+    return f"[{truncate(address, 10)}]({get_user_url(address)})"
 
 
 def generate_opensea_salt():
@@ -234,16 +238,24 @@ async def get_highest_bid(asset_contract_address, token_id):
     return (None, None)
 
 
-async def get_offers(asset_contract_address, token_id):
+async def get_offers(asset_contract_address, token_id, limit=5):
     url = f"{opensea_urls['offers']}?" \
           f"asset_contract_address={asset_contract_address}&" \
           f"token_ids={token_id}&" \
           f"order_by=eth_price&" \
           f"order_direction=desc&" \
-          f"limit=5"
+          f"limit={limit}"
 
     response = await http_client.get(url, headers=get_os_api_headers())
     return response.json()
+
+
+async def get_offers_len(asset_contract_address, token_id):
+    response = await get_offers(asset_contract_address, token_id, 50)
+    if not "orders" in response:
+        return 0
+
+    return len(response["orders"])
 
 
 async def get_cheapest_listing(asset_contract_address, token_id):
@@ -277,6 +289,14 @@ async def get_listings(contract_address, token_id, order_by, order_dir, limit):
     return response.json()
 
 
+async def get_listings_len(contract_address, token_id):
+    response = await get_listings(contract_address, token_id, "created_date", "asc", 50)
+    if not "orders" in response:
+        return 0
+
+    return len(response["orders"])
+
+
 async def cheapest_listing(ctx, contract_address, token_id, order_by="eth_price", order_dir="asc"):
     response = await get_listings(contract_address, token_id, order_by, order_dir, 1)
 
@@ -302,7 +322,7 @@ async def cheapest_listing(ctx, contract_address, token_id, order_by="eth_price"
         description=asset["description"],
         images=asset["image_url"],
         fields=[{"name": "Token ID",
-                 "value": format_asset_url(token_id, asset_contract_address, token_id),
+                 "value": format_asset_url(truncate(token_id, 10), asset_contract_address, token_id),
                  "inline": True},
                 {"name": "Offerer",
                  "value": format_user_address_url(listing["maker"]["address"]),
@@ -342,12 +362,9 @@ async def get_ntfs(slug, limit=50, next_cursor=""):
 
 
 async def get_ntf(chain, contract_address, token_id):
-    logger.info(f"loading {chain} {contract_address} {token_id}")
     url = f"https://api.opensea.io/v2/chain/{chain}/contract/{contract_address}/nfts/{token_id}"
 
     response = await http_client.get(url, headers=get_os_api_headers())
-
-    logger.info(response)
 
     return response.json()
 
@@ -362,34 +379,47 @@ async def get_nft_basic_info(chain, contract_address, token_id):
     return nft["name"], nft["image_url"], nft["description"]
 
 
-def embed_nft(contract_address, nft):
+def embed_nft(contract_address, nft, listings_len, offers_len):
     asset_url = get_asset_url(
         asset_contract_address=contract_address,
         token_id=nft["identifier"])
 
-    logger.info(nft)
+    owners = nft["owners"]
+
+    fields = [{
+        "name": "Token ID",
+        "value": f"[{nft['identifier']}]({asset_url})",
+        "inline": True
+    }, {
+        "name": "Creator",
+        "value": f"{format_user_address_url(nft['creator'])}",
+        "inline": True
+    }, {
+        "name": "Listings",
+        "value": f"{listings_len}",
+        "inline": True
+    }, {
+        "name": "Offers",
+        "value": f"{offers_len}",
+        "inline": True
+    }, {
+        "name": "Minted",
+        "value": f"{format_datetime(parse_datetime(nft['created_at']))}",
+        "inline": True}]
+
+    if owners is not None and len(owners) > 0:
+        owner_field = {
+            "name": "Owner",
+            "value": f"{format_user_address_url(owners[0]['address'])}",
+            "inline": True
+        }
+        fields.insert(2, owner_field)
 
     return Embed(
         title=nft["name"],
         description=nft["description"],
         images=nft["image_url"],
-        fields=[{
-            "name": "Token ID",
-            "value": f"[{nft['identifier']}]({asset_url})",
-            "inline": True
-        }, {
-            "name": "Creator",
-            "value": f"{format_user_address_url(nft['creator'])}",
-            "inline": True
-        }, {
-            "name": "Owner",
-            "value": f"{format_user_address_url(nft['owners'][0]['address'])}",
-            "inline": True
-        }, {
-            "name": "Minted",
-            "value": f"{format_datetime(parse_datetime(nft['created_at']))}",
-            "inline": True
-        }])
+        fields=fields)
 
 
 async def nft(ctx, chain, contract_address, token_id):
@@ -400,7 +430,10 @@ async def nft(ctx, chain, contract_address, token_id):
 
     nft = response["nft"]
 
-    embed = embed_nft(contract_address, nft)
+    listings_len = await get_listings_len(contract_address, token_id)
+    offers_len = await get_offers_len(contract_address, token_id)
+
+    embed = embed_nft(contract_address, nft, listings_len, offers_len)
 
     return await ctx.send(embeds=embed, ephemeral=True)
 
@@ -470,7 +503,7 @@ def calculate_bid(current_price, bid_wei, highest_bid, token_name, eth_usd_price
             if not is_worth:  # user didn't specify bid and auction start price is less than 5 USD
                 desired_usd_worth = 5.01
                 if token_name == "eth" or token_name == "weth":
-                    desired_usd_worth = 5.1  # Add bit of a reserve
+                    desired_usd_worth = 5.4  # Add bit of a reserve
                 new_current_price = get_usd_worth_amount(desired_usd_worth, eth_usd_price, token_name)
                 current_price = safe_to_wei(restrict_to_multiples(new_current_price), token_name)
     return current_price
@@ -588,7 +621,7 @@ async def start_stream(bot, slug, channel_id, filters={}):
 async def approve_erc20_allowance(
         ctx: SlashContext, tx_db: TxDB, asset_name, user_address, price, allowance, token_name, token_contract,
         token_id, next_tx_to, next_tx_data, next_tx_value, is_bid, highest_bid, expiration_time, asset_url,
-        asset_img=""):
+        asset_contract_address, asset_img=""):
     try:
         tx_key = generate_tx_key()
 
@@ -606,6 +639,7 @@ async def approve_erc20_allowance(
                   "is_bid": is_bid,
                   "asset_url": asset_url,
                   "asset_img": asset_img,
+                  "asset_contract_address": asset_contract_address,
                   "token_id": token_id,
                   "next_tx_to": next_tx_to,
                   "next_tx_from": user_address,
@@ -631,7 +665,7 @@ async def approve_erc20_allowance(
             description=f"In order to approve `{token_symbol}` transfers, {tx_link_instruction_text}",
             fields=[
                 {"name": "Asset Name",
-                 "value": f"[{truncate_string(asset_name, 20)}]({asset_url})",
+                 "value": f"[{truncate(asset_name, 20)}]({asset_url})",
                  "inline": True},
                 {"name": "Price",
                  "value": f"{format_wei_price(price, token_name)}",
@@ -659,7 +693,8 @@ async def approve_erc20_allowance(
 
 async def send_buy_tx_url(
         ctx: SlashContext, tx_db: TxDB, web3, asset_name, price, token_name, tx_to, tx_from, tx_data, tx_value,
-        token_id, ctx_author_id, ctx_channel_id, expiration_time, highest_bid, is_bid, asset_url, asset_img=""):
+        token_id, ctx_author_id, ctx_channel_id, expiration_time, highest_bid, is_bid, asset_url,
+        asset_contract_address, asset_img=""):
     try:
         tx = {
             "to": tx_to,
@@ -672,6 +707,12 @@ async def send_buy_tx_url(
         formatted_price = format_wei_price(price, token_name)
         expiration_datetime = datetime.fromtimestamp(expiration_time)
         formatted_expiration = format_datetime(expiration_datetime)
+
+        formatted_price_conv = formatted_price
+        if token_name == "eth" or token_name == "weth":
+            eth_usd_price = await discord_web3.get_eth_usd_price()
+            usd_price = get_usd_price(safe_to_ether(price, token_name), eth_usd_price, token_name)
+            formatted_price_conv = f"{formatted_price} ({round(usd_price, 1)} USD)"
 
         tx_db.add_tx(
             {"tx_key": tx_key,
@@ -699,13 +740,13 @@ async def send_buy_tx_url(
                 title=f"Make `{formatted_price}` offer for the {asset_name}",
                 description=f"In order to make an offer for the `{asset_name}`, {tx_link_instruction_text}",
                 fields=[{"name": "Asset Name", "value": f"[{asset_name}]({asset_url})", "inline": True},
-                        {"name": "Your Offer", "value": f"{formatted_price}", "inline": True},
+                        {"name": "Your Offer", "value": f"{formatted_price_conv}", "inline": True},
                         {"name": "Highest Offer",
                          "value": "None" if highest_bid is None else format_wei_price(highest_bid, token_name),
                          "inline": True},
                         {"name": "Current Balance",
                          "value": format_wei_price(user_balance, token_name), "inline": True},
-                        {"name": "Expiration", "value": formatted_expiration}],
+                        {"name": "Expiration", "value": formatted_expiration, "inline": True}],
                 images=asset_img,
                 color=BrandColors.GREEN,
                 url=tx_url)
@@ -758,7 +799,7 @@ async def buy(
 
         cheapest_listing = await get_cheapest_listing(asset_contract_address, token_id)
 
-        if (not bid or not currency) and not cheapest_listing:
+        if (bid is None or currency is None) and not cheapest_listing:
             highest_bid, highest_bid_token = await get_highest_bid(asset_contract_address, token_id)
             if highest_bid:
                 highest_bid_token_name = get_token_name(highest_bid_token)
@@ -779,19 +820,16 @@ async def buy(
                                   f"parameters. {highest_bid_msg}",
                                   ephemeral=True, components=components)
 
-        if currency:
-            cons_token = get_token_address(currency)
-            cons_token_name, cons_token_contract = get_token_contract(web3, cons_token)
-        else:
+        if (bid is None or bid == 0) and cheapest_listing:
             cons_token = cheapest_listing["protocol_data"]["parameters"]["consideration"][0]["token"]
             cons_token_name, cons_token_contract = get_token_contract(web3, cons_token)
-
-        if (not bid or not currency) and cheapest_listing:
             current_price = int(cheapest_listing["current_price"])
             order_type = cheapest_listing["order_type"]
             offerer = cheapest_listing["protocol_data"]["parameters"]["offerer"]
             expiration_time = cheapest_listing["expiration_time"]
         else:
+            cons_token = get_token_address(currency)
+            cons_token_name, cons_token_contract = get_token_contract(web3, cons_token)
             current_price = 0
             order_type = None
             offerer = ""
@@ -801,7 +839,7 @@ async def buy(
             return await ctx.send(f"It seems that your linked Ethereum address has listed `{asset_name}` on OpenSea.",
                                   ephemeral=True)
 
-        if bid is None and cheapest_listing:
+        if bid is None or bid == 0 and cheapest_listing:
             order_hash = cheapest_listing["order_hash"]
             protocol_address = cheapest_listing["protocol_address"]
             fulfillment = await get_fulfillment(order_hash, protocol_address, user_address)
@@ -879,6 +917,7 @@ async def buy(
                     highest_bid=highest_bid,
                     is_bid=is_bid,
                     asset_url=get_asset_url(asset_contract_address, token_id),
+                    asset_contract_address=asset_contract_address,
                     asset_img=asset_img,
                     token_id=token_id,
                     next_tx_to=contract_addresses["Seaport"],
@@ -896,6 +935,7 @@ async def buy(
             expiration_time=expiration_time,
             highest_bid=highest_bid,
             asset_url=get_asset_url(asset_contract_address, token_id),
+            asset_contract_address=asset_contract_address,
             asset_img=asset_img,
             token_id=token_id,
             tx_to=contract_addresses["Seaport"],
@@ -991,6 +1031,7 @@ async def offers(
                  "order_hash": offer["order_hash"],
                  "protocol_address": offer["protocol_address"],
                  "asset_url": asset_url,
+                 "asset_img": asset_img,
                  "order_type": offer["order_type"],
                  "user_address": user_address,
                  "formatted_price": formatted_price,
@@ -1222,7 +1263,7 @@ async def bid_callback(bot, tx, tx_signature, next_action_data):
             embeds = Embed(title=asset_name,
                            images=asset_img,
                            fields=[{"name": "Token ID",
-                                    "value": f"[{asset_name}]({asset_url})",
+                                    "value": f"[{truncate(token_id, 10)}]({asset_url})",
                                     "inline": True}])
 
         return await channel.send(
@@ -1256,7 +1297,7 @@ async def buy_callback(bot, web3, tx, tx_hash, next_action_data):
             embeds = Embed(title=asset_name,
                            images=asset_img,
                            fields=[{"name": "Token ID",
-                                    "value": f"[{token_id}]({asset_url})",
+                                    "value": f"[{truncate(token_id, 10)}]({asset_url})",
                                     "inline": True}])
 
         return await channel.send(
@@ -1374,6 +1415,7 @@ async def approve_erc20_allowance_callback(bot, web3, tx_db: TxDB, tx, tx_hash, 
             tx_value=next_action_data["next_tx_value"],
             is_bid=next_action_data["is_bid"],
             asset_url=next_action_data["asset_url"],
+            asset_contract_address=next_action_data["asset_contract_address"],
             token_id=next_action_data["token_id"],
             highest_bid=next_action_data["highest_bid"],
             expiration_time=next_action_data["expiration_time"],
@@ -1406,7 +1448,7 @@ async def accept_offer_callback(bot, web3, tx, tx_hash, next_action_data):
             embeds = Embed(title=asset_name,
                            images=asset_img,
                            fields=[{"name": "Token ID",
-                                    "value": f"[{token_id}]({asset_url})",
+                                    "value": f"[{truncate(token_id, 10)}]({asset_url})",
                                     "inline": True}])
 
         return await channel.send(
@@ -1418,16 +1460,21 @@ async def accept_offer_callback(bot, web3, tx, tx_hash, next_action_data):
 
 
 def get_payload_basic_info(payload):
-    asset_name = payload.get("item", {}).get("metadata", {}).get("name", "")
-    permalink = payload.get("item", {}).get("permalink", "")
-    image_url = payload.get("item", {}).get("metadata", {}).get("image_url", "")
+    item = payload.get("item", {})
+    asset_name = item.get("metadata", {}).get("name", "")
+    permalink = item.get("permalink", "")
+    image_url = item.get("metadata", {}).get("image_url", "")
     token_symbol = payload.get("payment_token", {}).get("symbol", "").lower()
     maker = payload.get("maker", {}).get("address", "")
-    return asset_name, permalink, image_url, token_symbol, maker
+
+    url_segments = permalink.split("/")
+    token_id = int(url_segments[-1])
+
+    return asset_name, token_id, permalink, image_url, token_symbol, maker
 
 
 async def on_item_received_bid(payload, channel):
-    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+    asset_name, token_id, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
 
     if not asset_name:
         return
@@ -1439,7 +1486,9 @@ async def on_item_received_bid(payload, channel):
 
     embed = Embed(
         title=f"{asset_name} has just received an offer!",
-        fields=[{"name": "Asset name", "value": f"[{asset_name}]({asset_url})", "inline": True},
+        fields=[{"name": "Asset Name",
+                 "value": f"[{asset_name}]({asset_url})",
+                 "inline": True},
                 {"name": "Offerer",
                  "value": format_user_address_url(maker),
                  "inline": True},
@@ -1456,13 +1505,13 @@ async def on_item_received_bid(payload, channel):
         style=ButtonStyle.GRAY,
         label=f"Make Better Offer",
         emoji="☝",
-        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{asset_name}")
+        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{get_button_id(asset_name, token_id)}")
 
     return await channel.send("", embeds=embed, components=components)
 
 
 async def on_item_sold(payload, channel):
-    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+    asset_name, token_id, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
 
     if not asset_name:
         return
@@ -1490,13 +1539,13 @@ async def on_item_sold(payload, channel):
         style=ButtonStyle.GRAY,
         label=f"Make New Offer",
         emoji="☝",
-        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{asset_name}")
+        custom_id=f"offer_btn_{new_offer_price}_{token_name}_{get_button_id(asset_name, token_id)}")
 
     return await channel.send("", embeds=embed, components=components)
 
 
 async def on_item_listed(payload, channel):
-    asset_name, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
+    asset_name, token_id, asset_url, image_url, token_name, maker = get_payload_basic_info(payload)
 
     if not asset_name:
         return
@@ -1524,7 +1573,7 @@ async def on_item_listed(payload, channel):
         style=ButtonStyle.GRAY,
         label=f"Buy",
         emoji="☝",
-        custom_id=f"buy_btn_{asset_name}")
+        custom_id=f"buy_btn_{get_button_id(asset_name, token_id)}")
 
     return await channel.send("", embeds=embed, components=components)
 

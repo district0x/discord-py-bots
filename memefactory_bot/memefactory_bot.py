@@ -145,7 +145,7 @@ async def buy(ctx: SlashContext, token_id, bid=None, currency=None):
         asset_img=asset_img,
         asset_contract_address=asset_contract_address,
         token_id=token_id,
-        asset_type=AssetType.ERC1155 if is_wrapped else AssetType.ERC721,
+        asset_type=AssetType.ERC721,
         bid=bid,
         currency=currency)
 
@@ -154,7 +154,6 @@ async def buy(ctx: SlashContext, token_id, bid=None, currency=None):
 async def buy_btn_callback(ctx: ComponentContext):
     token_id = re.sub(r"^buy_btn_", "", ctx.custom_id)
     await ctx.defer(ephemeral=True)
-    logger.info("buy btn callback")
 
     asset_name, asset_img, _ = await discord_opensea.get_nft_basic_info(chain, asset_contract_address, token_id)
 
@@ -298,28 +297,69 @@ async def sell(ctx: SlashContext, token_id, start_price, end_price=None, duratio
         raise e
 
 
+async def on_owned_nfts_buy_btn(ctx, paginator, owner):
+    token_id = discord_web3.get_token_of_owner(memetoken, owner, paginator.page_index)
+    asset_name, asset_img, _ = await discord_opensea.get_nft_basic_info(chain, asset_contract_address, token_id)
+
+    return await discord_opensea.buy(
+        ctx=ctx,
+        web3=web3,
+        user_address_db=user_address_db,
+        tx_db=tx_db,
+        asset_name=asset_name,
+        asset_img=asset_img,
+        asset_contract_address=asset_contract_address,
+        token_id=token_id,
+        asset_type=AssetType.ERC721,
+        bid=0,
+        currency="eth",
+        force_bid=True)
+
+
+async def on_owned_nfts_offers_btn(ctx, paginator, owner):
+    token_id = discord_web3.get_token_of_owner(memetoken, owner, paginator.page_index)
+    asset_name, asset_img, _ = await discord_opensea.get_nft_basic_info(chain, asset_contract_address, token_id)
+
+    return await discord_opensea.offers(
+        bot=bot,
+        ctx=ctx,
+        user_address_db=user_address_db,
+        tx_db=tx_db,
+        web3=web3,
+        asset_contract_address=asset_contract_address,
+        token_id=token_id,
+        asset_name=asset_name,
+        asset_img=asset_img,
+        asset_owner=owner)
+
+
 async def _owned_memes(ctx, owner_address, flex=False):
     user_address = user_address_db.get_address(ctx.author_id)
-    balance = discord_web3.get_balance_of(memetoken, user_address)
+    owner_address = Web3.to_checksum_address(owner_address)
+    balance = discord_web3.get_balance_of(memetoken, owner_address)
 
     if balance == 0:
-        return await ctx.send("It appears that you don't own any memes yet.", ephemeral=True)
+        return await ctx.send("It appears that this account doesn't own collectibles yet.", ephemeral=True)
 
     pages = []
-    for i in range(balance - 1):
+    for i in range(balance):
         pages.append(discord_opensea.OwnedNFTPage(
             content="",
             index=i,
             asset_contract=memetoken,
-            owner=user_address,
-            chain=chain
-        ))
-
-    # paginator = Paginator.create_from_embeds(bot, *embeds)
+            owner=owner_address,
+            chain=chain))
 
     paginator = AsyncPaginator(bot, pages=pages)
-
     paginator.default_button_color = ButtonStyle.GRAY
+    paginator.show_callback_button = True
+
+    if user_address.lower() != owner_address.lower():
+        paginator.callback = partial(on_owned_nfts_buy_btn, paginator=paginator, owner=owner_address)
+        paginator.callback_button_emoji = "🛒"
+    else:
+        paginator.callback = partial(on_owned_nfts_offers_btn, paginator=paginator, owner=owner_address)
+        paginator.callback_button_emoji = "🤝"
 
     return await paginator.send(ctx)
 
