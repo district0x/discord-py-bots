@@ -13,7 +13,7 @@ from decimal import Decimal, ROUND_DOWN
 from quart import Quart, request, jsonify, abort
 import nest_asyncio
 from db.tx_db import TxDB
-from db.user_address_db import UserAddressDB
+from db.user_db import UserDB
 from quart_cors import cors
 import httpx
 import discord_opensea.discord_opensea as discord_opensea
@@ -39,7 +39,8 @@ discord_web3.server_port = os.getenv('SERVER_PORT')
 discord_web3.tx_check_interval = int(os.getenv('TX_CHECK_INTERVAL'))
 stream_channel_id = int(os.getenv('STREAM_CHANNEL_ID'))
 discord_opensea.stream_interval = int(os.getenv('STREAM_INTERVAL'))
-db_path = os.getenv('SQLITE_DB_PATH')
+user_db_path = os.getenv('USER_DB_PATH')
+tx_db_path = os.getenv('TX_DB_PATH')
 
 contract_addresses = {  # Make sure addresses are checksum format
     "ETHRegistrarController": "0x253553366Da8546fC250F225fe3d25d0C782303b",
@@ -57,8 +58,8 @@ intents.guilds = True
 intents.message_content = True
 intents.members = True
 
-tx_db = TxDB(db_path)
-user_address_db = UserAddressDB(db_path)
+tx_db = TxDB(tx_db_path)
+user_db = UserDB(user_db_path)
 bot = Client(intents=intents)
 
 
@@ -225,7 +226,7 @@ async def buy(ctx: SlashContext, ens_name, bid=None, currency=None):
         return await discord_opensea.buy(
             ctx=ctx,
             web3=web3,
-            user_address_db=user_address_db,
+            user_db=user_db,
             tx_db=tx_db,
             asset_name=cured_name,
             asset_contract_address=asset_contract_address,
@@ -247,7 +248,7 @@ async def buy_btn_callback(ctx: ComponentContext):
     return await discord_opensea.buy(
         ctx=ctx,
         web3=web3,
-        user_address_db=user_address_db,
+        user_db=user_db,
         tx_db=tx_db,
         asset_name=ens_name,
         token_id=token_id,
@@ -270,7 +271,7 @@ async def offer_btn_callback(ctx: ComponentContext):
         return await discord_opensea.buy(
             ctx=ctx,
             web3=web3,
-            user_address_db=user_address_db,
+            user_db=user_db,
             tx_db=tx_db,
             asset_name=ens_name,
             token_id=token_id,
@@ -308,7 +309,7 @@ async def offers(ctx: SlashContext, ens_name):
         return await discord_opensea.offers(
             bot=bot,
             ctx=ctx,
-            user_address_db=user_address_db,
+            user_db=user_db,
             tx_db=tx_db,
             web3=web3,
             asset_contract_address=asset_contract_address,
@@ -326,7 +327,7 @@ async def link_wallet(ctx: SlashContext):
 
 @slash_command(name="unlink-wallet", description="Unlink your Ethereum address from your Discord account.")
 async def unlink_wallet(ctx: SlashContext):
-    return await discord_web3.unlink_wallet(ctx=ctx, user_address_db=user_address_db)
+    return await discord_web3.unlink_wallet(ctx=ctx, user_db=user_db)
 
 
 @slash_command(name="sell", description="Sell your ENS name on OpenSea")
@@ -375,7 +376,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
                                   ephemeral=True)
 
         owner, token_id, is_wrapped = await get_ens_name_owner(cured_name)
-        user_address = user_address_db.get_address(ctx.author_id)
+        user_address = user_db.get_address(ctx.author_id)
 
         if owner is None or owner.lower() != user_address.lower():
             await ctx.send(f"It appears that you don't own `{cured_name}`.", ephemeral=True)
@@ -385,7 +386,7 @@ async def sell(ctx: SlashContext, ens_name, start_price, end_price=None, duratio
 
         return await discord_opensea.sell(
             ctx=ctx,
-            user_address_db=user_address_db,
+            user_db=user_db,
             tx_db=tx_db,
             asset_name=cured_name,
             asset_type=AssetType.ERC721,
@@ -480,7 +481,7 @@ async def owned_names(ctx: SlashContext, owner_address):
 @auto_defer(ephemeral=True)
 async def my_names(ctx: SlashContext):
     try:
-        user_address = user_address_db.get_address(ctx.author_id)
+        user_address = user_db.get_address(ctx.author_id)
         if user_address is None:
             return await discord_web3.link_wallet(
                 ctx=ctx,
@@ -499,7 +500,7 @@ async def my_names(ctx: SlashContext):
 @auto_defer(ephemeral=False)
 async def flex(ctx: SlashContext):
     try:
-        user_address = user_address_db.get_address(ctx.author_id)
+        user_address = user_db.get_address(ctx.author_id)
         if user_address is None:
             return await discord_web3.link_wallet(
                 ctx=ctx,
@@ -516,7 +517,7 @@ async def flex(ctx: SlashContext):
 
 @slash_command(name="my-wallet", description="Shows your currently linked wallet address")
 async def my_wallet(ctx: SlashContext):
-    return await discord_web3.my_wallet(ctx, user_address_db)
+    return await discord_web3.my_wallet(ctx, user_db)
 
 
 @slash_command(name="register", description="Registers ENS name")
@@ -533,7 +534,7 @@ async def register(ctx: SlashContext, ens_name):
     register_duration = 31536000
 
     try:
-        user_address = user_address_db.get_address(ctx.author_id)
+        user_address = user_db.get_address(ctx.author_id)
         if user_address is None:
             await _link_wallet(ctx,
                                "To register your ENS name, we need your Ethereum address associated with your Discord account.")
@@ -735,7 +736,7 @@ async def user_post():
     }
 
     web3_callbacks = discord_web3.get_web3_callbacks(
-        bot, web3, user_address_db, tx, tx_result, json_data, next_action_data)
+        bot, web3, user_db, tx, tx_result, json_data, next_action_data)
     opensea_callbacks = discord_opensea.get_opensea_callbacks(bot, web3, tx_db, tx, tx_result, next_action_data)
 
     merged_callbacks = {**callbacks, **web3_callbacks, **opensea_callbacks}

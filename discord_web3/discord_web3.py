@@ -8,7 +8,7 @@ import httpx
 import httpx_cache
 from decimal import Decimal, ROUND_DOWN
 from db.tx_db import TxDB
-from db.user_address_db import UserAddressDB
+from db.user_db import UserDB
 from datetime import datetime, timedelta
 from eth_account.messages import encode_defunct, _hash_eip191_message
 from interactions import SlashContext, Embed, BrandColors
@@ -156,6 +156,14 @@ def get_nft_owner(asset_contract, token_id):
     return asset_contract.functions.ownerOf(token_id).call()
 
 
+def get_nft_total_supply(asset_contract):
+    return asset_contract.functions.totalSupply().call()
+
+
+def get_nft_token_by_index(asset_contract, index):
+    return asset_contract.functions.tokenByIndex(index).call()
+
+
 def get_usd_price(amount, eth_usd_price, token_name):
     if token_name == "usdc" or token_name == "dai":
         return amount
@@ -194,14 +202,14 @@ async def link_wallet(
 
 
 async def unlink_wallet(
-        ctx: SlashContext, user_address_db: UserAddressDB,
+        ctx: SlashContext, user_db: UserDB,
         message="Your Ethereum address was successfully unlinked from your Discord account."):
-    user_address_db.remove_user(ctx.author_id)
+    user_db.remove_user(ctx.author_id)
     return await ctx.send(message, ephemeral=True)
 
 
-async def my_wallet(ctx: SlashContext, user_address_db: UserAddressDB):
-    user_address = user_address_db.get_address(ctx.author_id)
+async def my_wallet(ctx: SlashContext, user_db: UserDB):
+    user_address = user_db.get_address(ctx.author_id)
     if user_address is None:
         return await ctx.send("You currently don't have any Ethereum address linked with your Discord account.",
                               ephemeral=True)
@@ -210,7 +218,7 @@ async def my_wallet(ctx: SlashContext, user_address_db: UserAddressDB):
 
 
 async def link_wallet_callback(
-        bot, web3: Web3, user_address_db: UserAddressDB, tx, tx_signature, message, next_action_data):
+        bot, web3: Web3, user_db: UserDB, tx, tx_signature, message, next_action_data):
     try:
         user = bot.get_user(int(tx["user"]))
 
@@ -228,17 +236,17 @@ async def link_wallet_callback(
             logger.error(f"Invalid address recovered from signature: {signer}")
             return
 
-        user_address_db.add_user_address(tx["user"], Web3.to_checksum_address(signer), tx["tx_key"], tx_signature)
+        user_db.add_user_address(tx["user"], Web3.to_checksum_address(signer), tx["tx_key"], tx_signature)
 
         await user.send(
             f"Thank you. Your Ethereum address `{signer}` has been successfully linked with your Discord account. "
-            f"Feel free to start trading some ENS names now!")
+            f"Feel free to start trading some NFTs now!")
     except Exception as e:
         logger.error(f"link_wallet_callback {str(e)}")
         raise e
 
 
-def get_web3_callbacks(bot, web3, user_address_db, tx, tx_result, json_data, next_action_data):
+def get_web3_callbacks(bot, web3, user_db, tx, tx_result, json_data, next_action_data):
     return {"link_wallet": (
         link_wallet_callback,
-        (bot, web3, user_address_db, tx, tx_result, json_data.get("message", ""), next_action_data))}
+        (bot, web3, user_db, tx, tx_result, json_data.get("message", ""), next_action_data))}

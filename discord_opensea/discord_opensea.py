@@ -9,8 +9,9 @@ from discord_web3.discord_web3 import safe_to_wei, safe_to_ether, get_usd_price,
 import discord_web3.discord_web3 as discord_web3
 from functools import partial
 from decimal import Decimal, ROUND_DOWN
+from async_paginator.async_paginator import AsyncPaginator
 from db.tx_db import TxDB
-from db.user_address_db import UserAddressDB
+from db.user_db import UserDB
 from web3 import Web3
 from enum import Enum
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ import json
 import asyncio
 import random
 import attrs
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discord_opensea")
@@ -65,16 +67,18 @@ class AssetTypeEncoder(json.JSONEncoder):
 
 @attrs.define(eq=False, order=False, hash=False, kw_only=False)
 class NFTPage(Page):
-    token_id: int = attrs.field(repr=False, kw_only=True, default=0)
+    index: int = attrs.field(repr=False, kw_only=True, default=0)
     chain: str = attrs.field(repr=False, kw_only=True, default="ethereum")
-    contract_address: str = attrs.field(repr=False, kw_only=True, default=None)
+    asset_contract: object = attrs.field(repr=False, kw_only=True)
 
     async def to_embed(self) -> Embed:
-        response = await get_ntf(self.chain, self.contract_address, self.token_id)
-        listings_len = await get_listings_len(self.contract_address, self.token_id)
-        offers_len = await get_offers_len(self.contract_address, self.token_id)
+        contract_address = self.asset_contract.address
+        token_id = discord_web3.get_nft_token_by_index(self.asset_contract, self.index)
+        response = await get_ntf(self.chain, contract_address, token_id)
+        listings_len = await get_listings_len(contract_address, token_id)
+        offers_len = await get_offers_len(contract_address, token_id)
         nft = response["nft"]
-        return embed_nft(self.contract_address, nft, listings_len, offers_len)
+        return embed_nft(contract_address, nft, listings_len, offers_len)
 
 
 @attrs.define(eq=False, order=False, hash=False, kw_only=False)
@@ -85,13 +89,13 @@ class OwnedNFTPage(Page):
     owner: str = attrs.field(repr=False, kw_only=True)
 
     async def to_embed(self) -> Embed:
+        contract_address = self.asset_contract.address
         token_id = discord_web3.get_token_of_owner(self.asset_contract, self.owner, self.index)
-        response = await get_ntf(self.chain, self.asset_contract.address, token_id)
-        listings_len = await get_listings_len(self.asset_contract.address, token_id)
-        offers_len = await get_offers_len(self.asset_contract.address, token_id)
+        response = await get_ntf(self.chain, contract_address, token_id)
+        listings_len = await get_listings_len(contract_address, token_id)
+        offers_len = await get_offers_len(contract_address, token_id)
         nft = response["nft"]
-
-        return embed_nft(self.asset_contract.address, nft, listings_len, offers_len)
+        return embed_nft(contract_address, nft, listings_len, offers_len)
 
 
 def get_os_api_headers():
@@ -311,11 +315,18 @@ async def cheapest_listing(ctx, contract_address, token_id, order_by="eth_price"
     asset_name = asset["name"]
     token_id = int(asset["token_id"])
     asset_contract_address = asset["asset_contract"]["address"]
-    current_price = listing["current_price"]
+    current_price = int(listing["current_price"])
     cons_token_address = listing["protocol_data"]["parameters"]["consideration"][0]["token"]
     cons_token_name = get_token_name(cons_token_address)
     listed_dt = datetime.fromtimestamp(listing["listing_time"])
     expiration_dt = datetime.fromtimestamp(listing["expiration_time"])
+
+    formatted_price = format_wei_price(current_price, cons_token_name)
+    if cons_token_name == "eth" or cons_token_name == "weth":
+        eth_usd_price = await discord_web3.get_eth_usd_price()
+        usd_price = get_usd_price(safe_to_ether(current_price, cons_token_name), eth_usd_price, cons_token_name)
+        formatted_price_usd = f"{round(usd_price, 1)} USD"
+        formatted_price_both = f"{formatted_price} ({formatted_price_usd})"
 
     embed = Embed(
         title=asset["name"],
@@ -337,7 +348,7 @@ async def cheapest_listing(ctx, contract_address, token_id, order_by="eth_price"
                  "value": format_datetime(expiration_dt),
                  "inline": True},
                 {"name": "Price",
-                 "value": format_wei_price(current_price, cons_token_name),
+                 "value": formatted_price_both,
                  "inline": True}])
 
     component = Button(
@@ -433,9 +444,148 @@ async def nft(ctx, chain, contract_address, token_id):
     listings_len = await get_listings_len(contract_address, token_id)
     offers_len = await get_offers_len(contract_address, token_id)
 
-    embed = embed_nft(contract_address, nft, listings_len, offers_len)
+    embeds = embed_nft(contract_address, nft, listings_len, offers_len)
 
-    return await ctx.send(embeds=embed, ephemeral=True)
+    components = Button(
+        style=ButtonStyle.GRAY,
+        label=f"Buy",
+        emoji="☝",
+        custom_id=f"buy_btn_{token_id}")
+
+    return await ctx.send(embeds=embeds, components=components, ephemeral=True)
+
+
+async def nfts(ctx: SlashContext, bot, web3, user_db, tx_db, chain, asset_contract, start_index=0):
+    total_supply = discord_web3.get_nft_total_supply(asset_contract)
+
+    pages = []
+    for i in range(total_supply):
+        pages.append(NFTPage(
+            content="",
+            index=i,
+            asset_contract=asset_contract,
+            chain=chain))
+
+    paginator = AsyncPaginator(bot, pages=pages)
+    paginator.default_button_color = ButtonStyle.GRAY
+    paginator.show_callback_button = True
+
+    paginator.callback = partial(
+        on_nfts_buy_btn,
+        paginator=paginator,
+        web3=web3,
+        user_db=user_db,
+        tx_db=tx_db,
+        chain=chain,
+        asset_contract=asset_contract)
+    paginator.callback_button_emoji = "🛒"
+    paginator.page_index = start_index
+
+    return await paginator.send(ctx)
+
+
+async def on_nfts_buy_btn(ctx, paginator, web3, user_db, tx_db, chain, asset_contract):
+    token_id = discord_web3.get_nft_token_by_index(asset_contract, paginator.page_index)
+    asset_name, asset_img, _ = await get_nft_basic_info(chain, asset_contract.address, token_id)
+
+    return await buy(
+        ctx=ctx,
+        web3=web3,
+        user_db=user_db,
+        tx_db=tx_db,
+        asset_name=asset_name,
+        asset_img=asset_img,
+        asset_contract_address=asset_contract.address,
+        token_id=token_id,
+        asset_type=AssetType.ERC721)
+
+
+async def owned_nfts(ctx, bot, web3, user_db, tx_db, chain, asset_contract, owner_address):
+    user_address = user_db.get_address(ctx.author_id)
+    if owner_address is None:
+        return await discord_web3.link_wallet(
+            ctx=ctx,
+            tx_db=tx_db,
+            message="To display your own NFTs, it requires your Ethereum "
+                    "address linked to your Discord account.")
+
+    owner_address = Web3.to_checksum_address(owner_address)
+    balance = discord_web3.get_balance_of(asset_contract, owner_address)
+
+    if balance == 0:
+        return await ctx.send("It appears that this account doesn't own NFTs yet.", ephemeral=True)
+
+    pages = []
+    for i in range(balance):
+        pages.append(OwnedNFTPage(
+            content="",
+            index=i,
+            asset_contract=asset_contract,
+            owner=owner_address,
+            chain=chain))
+
+    paginator = AsyncPaginator(bot, pages=pages)
+    paginator.default_button_color = ButtonStyle.GRAY
+    paginator.show_callback_button = True
+
+    if user_address.lower() != owner_address.lower():
+        paginator.callback = partial(
+            on_owned_nfts_buy_btn,
+            paginator=paginator,
+            web3=web3,
+            user_db=user_db,
+            tx_db=tx_db,
+            chain=chain,
+            asset_contract=asset_contract,
+            owner=owner_address)
+        paginator.callback_button_emoji = "🛒"
+    else:
+        paginator.callback = partial(
+            on_owned_nfts_offers_btn,
+            paginator=paginator,
+            bot=bot,
+            web3=web3,
+            user_db=user_db,
+            tx_db=tx_db,
+            chain=chain,
+            asset_contract=asset_contract,
+            owner=owner_address)
+        paginator.callback_button_emoji = "🤝"
+
+    return await paginator.send(ctx)
+
+
+async def on_owned_nfts_buy_btn(ctx, paginator, web3, user_db, tx_db, chain, asset_contract, owner):
+    token_id = discord_web3.get_token_of_owner(asset_contract, owner, paginator.page_index)
+    asset_name, asset_img, _ = await get_nft_basic_info(chain, asset_contract.address, token_id)
+
+    return await buy(
+        ctx=ctx,
+        web3=web3,
+        user_db=user_db,
+        tx_db=tx_db,
+        asset_name=asset_name,
+        asset_img=asset_img,
+        asset_contract_address=asset_contract.address,
+        token_id=token_id,
+        asset_type=AssetType.ERC721)
+
+
+async def on_owned_nfts_offers_btn(ctx, paginator, bot, web3, user_db, tx_db, chain, asset_contract, owner):
+    token_id = discord_web3.get_token_of_owner(asset_contract, owner, paginator.page_index)
+    asset_name, asset_img, _ = await get_nft_basic_info(chain, asset_contract.address, token_id)
+
+    return await offers(
+        bot=bot,
+        ctx=ctx,
+        user_db=user_db,
+        tx_db=tx_db,
+        web3=web3,
+        asset_contract_address=asset_contract.address,
+        token_id=token_id,
+        asset_name=asset_name,
+        asset_img=asset_img,
+        asset_owner=owner)
 
 
 async def get_fulfillment(order_hash, protocol_address, user_address):
@@ -708,11 +858,12 @@ async def send_buy_tx_url(
         expiration_datetime = datetime.fromtimestamp(expiration_time)
         formatted_expiration = format_datetime(expiration_datetime)
 
-        formatted_price_conv = formatted_price
+        formatted_price_both = formatted_price
         if token_name == "eth" or token_name == "weth":
             eth_usd_price = await discord_web3.get_eth_usd_price()
             usd_price = get_usd_price(safe_to_ether(price, token_name), eth_usd_price, token_name)
-            formatted_price_conv = f"{formatted_price} ({round(usd_price, 1)} USD)"
+            formatted_price_usd = f"{round(usd_price, 1)} USD"
+            formatted_price_both = f"{formatted_price} ({formatted_price_usd})"
 
         tx_db.add_tx(
             {"tx_key": tx_key,
@@ -739,8 +890,9 @@ async def send_buy_tx_url(
             embed = Embed(
                 title=f"Make `{formatted_price}` offer for the {asset_name}",
                 description=f"In order to make an offer for the `{asset_name}`, {tx_link_instruction_text}",
-                fields=[{"name": "Asset Name", "value": f"[{asset_name}]({asset_url})", "inline": True},
-                        {"name": "Your Offer", "value": f"{formatted_price_conv}", "inline": True},
+                fields=[{"name": "Asset Name", "value": f"[{truncate(asset_name, 20)}]({asset_url})", "inline": True},
+                        {"name": "Token ID", "value": f"[{truncate(token_id, 10)}]({asset_url})", "inline": True},
+                        {"name": "Your Offer", "value": f"{formatted_price_both}", "inline": True},
                         {"name": "Highest Offer",
                          "value": "None" if highest_bid is None else format_wei_price(highest_bid, token_name),
                          "inline": True},
@@ -758,12 +910,14 @@ async def send_buy_tx_url(
             embed = Embed(
                 title=f"Buy `{asset_name}`",
                 description=f"In order to purchase `{asset_name}`, {tx_link_instruction_text}",
-                fields=[{"name": "Asset Name", "value": f"[{asset_name}]({asset_url})", "inline": True},
+                fields=[{"name": "Asset Name", "value": f"[{truncate(asset_name, 20)}]({asset_url})", "inline": True},
+                        {"name": "Token ID", "value": f"[{truncate(token_id, 10)}]({asset_url})", "inline": True},
                         {"name": "Price", "value": f"{formatted_price}", "inline": True},
+                        {"name": "Price USD", "value": f"{formatted_price_usd}", "inline": True},
                         {"name": "Current Balance",
                          "value": format_wei_price(user_balance, token_name),
                          "inline": True},
-                        {"name": "Offer Ends", "value": formatted_expiration, "inline": True}],
+                        {"name": "Expiration", "value": formatted_expiration, "inline": True}],
                 images=asset_img,
                 color=BrandColors.GREEN,
                 url=tx_url)
@@ -780,7 +934,7 @@ async def send_buy_tx_url(
 
 
 async def buy(
-        ctx, web3, user_address_db: UserAddressDB, tx_db: TxDB, token_id, asset_type: AssetType, asset_name,
+        ctx, web3, user_db: UserDB, tx_db: TxDB, token_id, asset_type: AssetType, asset_name,
         asset_contract_address, asset_img="", bid=None, currency=None, force_bid=False):
     try:
         eth_usd_price = await discord_web3.get_eth_usd_price()
@@ -788,7 +942,7 @@ async def buy(
         highest_bid = None
         is_bid = False
 
-        user_address = user_address_db.get_address(ctx.author_id)
+        user_address = user_db.get_address(ctx.author_id)
 
         if user_address is None:
             return await discord_web3.link_wallet(
@@ -814,6 +968,12 @@ async def buy(
                     label=f"Make Better Offer",
                     emoji="☝",
                     custom_id=f"offer_btn_0_{highest_bid_token_name}_{get_button_id(asset_name, token_id)}")
+            else:
+                components = Button(
+                    style=ButtonStyle.GRAY,
+                    label=f"Make First Offer",
+                    emoji="☝",
+                    custom_id=f"offer_btn_0_eth_{get_button_id(asset_name, token_id)}")
 
             return await ctx.send(f"It appears that `{asset_name}` is not currently listed for sale on OpenSea. "
                                   f"You can still make an offer for this name by specifying `bid` and `currency` "
@@ -952,6 +1112,18 @@ async def buy(
         raise e
 
 
+def compile_buy_btn(custom_id):
+    return re.sub(r"^buy_btn_", "", custom_id)
+
+
+def compile_offer_btn(custom_id):
+    token_id = re.sub(r"^offer_btn_([\d.]+)_(\w{3,4})_", "", custom_id)
+    match = re.match(r"offer_btn_([\d.]+)_(\w{3,4})_", custom_id)
+    price = match.group(1)
+    token_name = match.group(2)
+    return token_id, price, token_name
+
+
 async def on_accept_offer_btn(ctx, tx_db: TxDB, web3, paginator, offers):
     offer = offers[paginator.page_index]
     fulfillment = await get_fulfillment(offer["order_hash"], offer["protocol_address"], offer["user_address"])
@@ -985,10 +1157,10 @@ async def on_accept_offer_btn(ctx, tx_db: TxDB, web3, paginator, offers):
 
 
 async def offers(
-        bot, ctx: SlashContext, user_address_db: UserAddressDB, tx_db: TxDB, web3, asset_contract_address, token_id,
+        bot, ctx: SlashContext, user_db: UserDB, tx_db: TxDB, web3, asset_contract_address, token_id,
         asset_name, asset_owner, asset_img=""):
     try:
-        user_address = user_address_db.get_address(ctx.author_id)
+        user_address = user_db.get_address(ctx.author_id)
 
         offers = await get_offers(asset_contract_address, token_id)
         asset_url = get_asset_url(asset_contract_address, token_id)
@@ -1099,17 +1271,22 @@ async def approve_opensea(ctx: SlashContext, tx_db: TxDB, user_address, asset_co
         embeds=embed, ephemeral=True)
 
 
-async def sell(ctx: SlashContext, user_address_db: UserAddressDB, tx_db: TxDB, asset_name, asset_type: AssetType,
+async def sell(ctx: SlashContext, user_db: UserDB, tx_db: TxDB, asset_name, asset_type: AssetType,
                token_id, asset_contract, start_price, end_price=None, duration_days=100, currency="eth",
                asset_img=""):
     try:
-        user_address = user_address_db.get_address(ctx.author_id)
+        user_address = user_db.get_address(ctx.author_id)
         if user_address is None:
             return await discord_web3.link_wallet(
                 ctx=ctx,
                 tx_db=tx_db,
                 message="In order to facilitate the sale of your NFT, we need your "
                         "Ethereum address associated with your Discord account.")
+
+        owner = discord_web3.get_nft_owner(asset_contract, token_id)
+
+        if owner is None or owner.lower() != user_address.lower():
+            return await ctx.send(f"It appears that you don't own `{asset_name}`.", ephemeral=True)
 
         if end_price is None:
             end_price = start_price
@@ -1264,6 +1441,9 @@ async def bid_callback(bot, tx, tx_signature, next_action_data):
                            images=asset_img,
                            fields=[{"name": "Token ID",
                                     "value": f"[{truncate(token_id, 10)}]({asset_url})",
+                                    "inline": True},
+                                   {"name": "Bid",
+                                    "value": formatted_price,
                                     "inline": True}])
 
         return await channel.send(
@@ -1340,7 +1520,13 @@ async def sell_callback(bot, web3, tx, tx_signature, next_action_data):
         asset_img = asset["image_url"]
         expiration_date = datetime.fromtimestamp(order["expiration_time"])
 
-        formatted_price = format_wei_price(order["current_price"], cons_token_name)
+        current_price = int(order["current_price"])
+        formatted_price = format_wei_price(current_price, cons_token_name)
+        if cons_token_name == "eth" or cons_token_name == "weth":
+            eth_usd_price = await discord_web3.get_eth_usd_price()
+            usd_price = get_usd_price(safe_to_ether(current_price, cons_token_name), eth_usd_price, cons_token_name)
+            formatted_price_usd = f"{round(usd_price, 1)} USD"
+            formatted_price_both = f"{formatted_price} ({formatted_price_usd})"
 
         display_asset_name = asset_name
         if asset_name is None:
@@ -1352,7 +1538,7 @@ async def sell_callback(bot, web3, tx, tx_signature, next_action_data):
                 {"name": "Asset name", "value": format_asset_url(display_asset_name, contract_address, token_id),
                  "inline": True},
                 {"name": "Offerer", "value": user.mention, "inline": True},
-                {"name": "Price", "value": formatted_price, "inline": True},
+                {"name": "Price", "value": formatted_price_both, "inline": True},
                 {"name": "Expiration", "value": format_datetime(expiration_date), "inline": True}
             ],
             images=asset_img,
