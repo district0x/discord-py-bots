@@ -14,7 +14,7 @@ Contextual Responses: The AI leverages past player messages and interactions to 
 
 Dynamic Prompts: The AI constructs prompts for the OpenAI GPT-3.5 engine that include:
 
-### Operating System (OS) Section: A static game world setting description
+## Operating System (OS) Section: A static game world setting description
 
 ### Hard Disk Drive (HDD) Section: Historical information about the player and related users
 
