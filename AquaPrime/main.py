@@ -10,9 +10,17 @@ import asyncio
 import openai
 import pymongo
 import re
+import pinecone
+import requests
+import time
+import numpy as np
+from datetime import datetime, timedelta
+import dateutil.parser
 from prompt_generator import PromptGenerator
 from discord.ext import commands
 from dotenv import load_dotenv
+
+load_dotenv()
 
 # Console Messages
 print(discord.__version__)
@@ -43,6 +51,11 @@ bot_discordbotlist = "https://discordbotlist.com/bots/AquaPrime"
 bot_discordbotsgg = "https://discord.bots.gg/bots/AquaPrime"
 bot_discordextremelist = "https://discordextremelist.xyz/en-US/bots/AquaPrime"
 bot_discordbotsggco = "https://discord.bots.gg/bots/AquaPrime"
+
+openai_embed_model = "text-embedding-ada-002"
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("grumpy_cat")
 
 # Create a dictionary of effects for the spell command
 last_execution = {}
@@ -159,6 +172,112 @@ class OpenAI:
             return "An error occurred while generating a response."
 
 
+class PineconeClient:
+    # Bot should listen for the word "quest" & "guild"
+    # When "quest" is read the bot should upsert message data to pinecone database
+    # When "#Quest" prompt is received, bot should respond with data regarding "quest" it has in pinecone database
+
+    def __init__(self, PINECONE_API_KEY, PINECONE_INDEX_NAME, PINECONE_ENVIRONMENT):
+        print("Initializing PineconeClient...")
+
+        pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+        self.index_name = PINECONE_INDEX_NAME
+        print(f"API Key: {PINECONE_API_KEY}")
+        print(f"Index Name: {PINECONE_INDEX_NAME}")
+        print(f"Environment: {PINECONE_ENVIRONMENT}")
+
+    def upsert_to_pinecone(self, message_id, message_content, user_id, timestamp):
+        print("Upserting to Pinecone...")
+
+        openai.api_key = os.environ["OPENAI_KEY"]
+        index = pinecone.Index(self.index_name)
+
+        openai.Engine.list()
+        MODEL = "text-embedding-ada-002"
+
+        res = openai.Embedding.create(
+            input=[message_content],
+            engine=MODEL,
+        )
+        embeds = [record["embedding"] for record in res["data"]]
+
+        if self.index_name not in pinecone.list_indexes():
+            pinecone.create_index(self.index_name, dimension=len(embeds[0]))
+
+        upsert_response = index.upsert(
+            vectors=[
+                {
+                    "id": str(message_id),
+                    "values": res["data"][0]["embedding"],
+                    "metadata": {
+                        "user_id": str(user_id),
+                        "message": message_content,
+                        "timestamp": timestamp,
+                    },
+                }
+            ]
+        )
+        print("Data Upsertion Complete...")
+
+        return upsert_response
+
+    def summarize(self, keyword, user_id):
+        print("Fetching from Pinecone...")
+
+        index = pinecone.Index(self.index_name)
+        openai.api_key = os.environ["OPENAI_KEY"]
+
+        openai.Engine.list()
+        MODEL = "text-embedding-ada-002"
+        res = openai.Embedding.create(
+            input=[keyword],
+            engine=MODEL,
+        )
+
+        one_day_ago = int((datetime.utcnow() - timedelta(days=1)).timestamp())
+
+        query_response = index.query(
+            top_k=10,
+            include_values=False,
+            include_metadata=True,
+            vector=res["data"][0]["embedding"],
+            filter={
+                "user_id": {"$eq": str(user_id)},
+                "timestamp": {"$gte": one_day_ago},
+            },
+        )
+
+        message_list = [
+            match["metadata"]["message"] for match in query_response["matches"]
+        ]
+
+        print("Message List reterieved from pinecone: ", message_list)
+
+        completion = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system",
+                    # Change this prompt to get different summary responses
+                    "content": "Provide detailed summary for each event that provided below.",
+                },
+                {"role": "user", "content": str(message_list)},
+            ],
+            n=1,
+            # Use max_tokens variable to change the length of the response
+            # max_tokens=250,
+            temperature=0,
+        )
+
+        print(completion.choices[0].message)
+
+        reply = completion.choices[0].message.content.strip()
+        reply = reply.split("Assistant:")[0].strip()
+        reply = reply.split("User:")[0].strip()
+
+        return reply
+
+
 # Process OS Context
 def process_os_context():
     os_context = "Aqua Prime, a virtual world where players engage in a multifaceted TTRPG experience."
@@ -204,6 +323,13 @@ async def on_ready():
     print(f'Logged in as {bot.user.name} - {bot.user.id}')
     print(f'This bot is in {len(bot.guilds)} guilds!')
 
+#pineconeClient
+pinecone_client = PineconeClient(
+    os.environ["PINECONE_API_KEY"],
+    os.environ["PINECONE_INDEX_NAME"],
+    os.environ["PINECONE_ENVIRONMENT"],
+)
+
 
 # Bot Message Event
 @bot.event
@@ -212,6 +338,48 @@ async def on_message(message):
         weaviate_client = WeaviateClient()
         openai_instance = OpenAI(weaviate_client)
         if message.author == bot.user:
+            return
+
+        keywords = ["quest", "guild"]
+        command_keywords = {"#quest": "Quest", "#guild": "Guild"}
+        is_command = any(
+            command in message.content.lower() for command in command_keywords
+        )
+
+        if not is_command and any(
+            keyword in message.content.lower() for keyword in keywords
+        ):
+
+            async def background_upsert(message):
+                message_id = message.id
+                message_content = re.sub(r"<@!?[0-9]+>", "", message.content).strip()
+                user_id = message.author.id
+                timestamp = int(datetime.utcnow().timestamp())
+                upsert_response = pinecone_client.upsert_to_pinecone(
+                    message_id, message_content, user_id, timestamp
+                )
+
+                upsert_response
+
+            asyncio.create_task(background_upsert(message))
+        else:
+            pass
+
+        for command, keyword in command_keywords.items():
+            if command in message.content.lower():
+                user_id = message.author.id
+
+                reply = pinecone_client.summarize(keyword, user_id)
+                async with message.channel.typing():
+                    await asyncio.sleep(2)  # optional, to enhance the typing effect
+                    await message.channel.send(reply)
+
+        try:
+            # Retrieve the Weaviate search results
+            weaviate_results = weaviate_client.search_data(str(message.author.id))
+            print("Weaviate search results:", weaviate_results)
+        except Exception as e:
+            print(f"Weaviate search error: {e}")
             return
 
         try:
