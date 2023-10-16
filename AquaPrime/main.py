@@ -259,7 +259,7 @@ class PineconeClient:
                 {
                     "role": "system",
                     # Change this prompt to get different summary responses
-                    "content": "Provide detailed summary for each event that provided below.",
+                    "content": "You are a knowledgeable record keeper, well-versed in the details of quests and guilds. Provide a detailed summary for each event mentioned below and keep the response under 2000 characters in length.",
                 },
                 {"role": "user", "content": str(message_list)},
             ],
@@ -274,6 +274,10 @@ class PineconeClient:
         reply = completion.choices[0].message.content.strip()
         reply = reply.split("Assistant:")[0].strip()
         reply = reply.split("User:")[0].strip()
+
+        # Truncate the message if it's longer than 2000 characters
+        if len(reply) > 2000:
+            reply = reply[:1997] + "..."
 
         return reply
 
