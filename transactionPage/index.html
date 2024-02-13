@@ -108,9 +108,15 @@ Linked address: ${data.address}`
             return c.charCodeAt(0);
         });
         var binaryData = new Uint8Array(bytes);
-        var decompressed = pako.inflate(binaryData, {
-            to: 'string'
-        });
+        try {
+            var decompressed = pako.inflate(binaryData, {
+                to: 'string'
+            });
+        } catch (e) {
+            contentEl.textContent = "Sorry, there is a problem decoding the transaction data. Please try again.";
+            console.error(e);
+        }
+
         return decompressed;
     }
 
@@ -123,7 +129,7 @@ Linked address: ${data.address}`
     }
 
     async function sendTransaction() {
-
+        console.log("Sending transaction");
         if (typeof BigInt === "undefined") {
             contentEl.textContent = "BigInt is not supported in this browser";
             console.log("BigInt is not supported in this browser");
@@ -143,6 +149,11 @@ Linked address: ${data.address}`
             });
 
             const txKey = getURLParameter("tx_key");
+
+            if (txKey == "" || txKey === null || txKey === undefined) {
+                contentEl.textContent = "Your transaction has been successfully sent, you can close this tab now.";
+                return;
+            }
 
             fetch(getHostURL(), {
                 method: 'POST',
@@ -206,6 +217,8 @@ Linked address: ${data.address}`
                     return;
                 }
 
+                contentEl.textContent = "Your transaction has been successfully signed, you can close this tab now.";
+
                 const txKey = getURLParameter("tx_key");
                 const txResult = response.result;
 
@@ -220,15 +233,27 @@ Linked address: ${data.address}`
                     }
                 }).then(response => {
                     if (response.ok) {
-                        contentEl.textContent = "Your data was successfully signed and sent to the Discord. You can close this tab now.";
+
                     } else if (response.status === 409) {
-                        contentEl.textContent = "This transaction has already been processed by our servers.";
+                        contentEl.textContent = "This transaction has already been processed by the server.";
+                    } else if (response.status === 400) {
+                        contentEl.textContent = "There was an issue with the request: ";
+                        response.json().then(data => {
+                            if (data.errors && data.errors.length > 0) {
+                                // Append each error message to the content element
+                                data.errors.forEach((error, index) => {
+                                    contentEl.textContent += (index > 0 ? ', ' : '') + error;
+                                });
+                            } else {
+                                contentEl.textContent += "An unknown error occurred.";
+                            }
+                        });
                     } else {
-                        contentEl.textContent = "Your data was signed, but we failed to reach our Discord.";
+                        contentEl.textContent = "Your data was signed, but we failed to reach the server.";
                         console.log(response);
                     }
                 }).catch(error => {
-                    contentEl.textContent = "Your data was signed, but we failed to reach our Discord.";
+                    contentEl.textContent = "Your data was signed, but we failed to reach the server.";
                     console.log(error);
                 });
 
@@ -259,15 +284,15 @@ Linked address: ${data.address}`
                         }
                     }).then(response => {
                         if (response.ok) {
-                            contentEl.textContent = "Your signature was successfully sent to the Discord. You can close this tab now.";
+                            contentEl.textContent = "Your signature was successfully sent to the server. You can close this tab now.";
                         } else if (response.status === 409) {
                             contentEl.textContent = "This transaction has already been processed by our servers.";
                         } else {
-                            contentEl.textContent = "Your signature is correct, but we failed to reach our Discord.";
+                            contentEl.textContent = "Your signature is correct, but we failed to reach the server.";
                             console.log(response);
                         }
                     }).catch(error => {
-                        contentEl.textContent = "Your signature is correct, but we failed to reach our Discord.";
+                        contentEl.textContent = "Your signature is correct, but we failed to reach the server.";
                         console.log(error);
                     });
                 })
